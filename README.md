@@ -30,12 +30,11 @@ workflow `.github/workflows/publish-<harness>.yml` runs on pushes that touch tha
 `shared/`, does a syntax check, and publishes only when that exact version is not on npm yet, so
 ordinary commits run the checks and skip publishing.
 
-Publishing uses npm trusted publishing (GitHub OIDC) with provenance, so no long-lived npm token
-is stored. The very first publish of a new package needs the `NPM_TOKEN` repository secret,
-because trusted publishing can only be configured on npm for a package that already exists:
-publish once with the secret, then configure the trusted publisher in the package settings on
-npmjs.com (repository Joly0/paperclip-ollama-cloud-adapters, workflow file name) and delete the
-secret.
+Publishing uses npm trusted publishing (GitHub OIDC) with provenance, so no npm token is stored.
+Trusted publishing is configured in the package settings on npmjs.com, so a new package needs one
+manual first publish by a maintainer (`npm publish --provenance=false --access public` from the
+package folder with the shared file copied in, confirmed with 2FA). Then add the trusted publisher
+there: repository Joly0/paperclip-ollama-cloud-adapters, workflow file `publish-<harness>.yml`.
 
 ## Adding a harness
 
