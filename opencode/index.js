@@ -168,17 +168,29 @@ async function execute(rawCtx) {
   if (!failed || ctx.signal?.aborted || result.errorFamily === "provider_quota") return result;
 
   // A limit hit mid-run surfaces as an ordinary OpenCode failure; the usage
-  // endpoint tells whether that is what happened. OpenCode may have acted, so
-  // no recovery evidence is added and Paperclip blocks the issue for review.
+  // endpoint tells whether that is what happened.
+  //
+  // Deliberate trade-off, chosen by the owner: the result claims bootstrap
+  // evidence (providerWorkStarted: false) although OpenCode has worked, so that
+  // Paperclip schedules the retry at the reset instead of blocking the issue.
+  // The claim is literally false; it is defensible because a limit stops
+  // OpenCode at its next model request, after earlier tool calls have settled,
+  // and the retry resumes the kept OpenCode session (sessionParams below)
+  // rather than replaying anything. Without it, every mid-run hit needs a
+  // manual comment to continue.
   const afterUsage = await fetchUsage(apiKey);
   const after = spentMeter(afterUsage);
   if (!after) return result;
   const fields = quotaFields(after, Boolean(afterUsage?.simulated));
-  await ctx.onLog("stderr", `[ollama-cloud] ${fields.errorMessage}\n`);
+  await ctx.onLog(
+    "stderr",
+    `[ollama-cloud] ${fields.errorMessage} The limit ran out mid-run; the retry resumes the same OpenCode session.\n`,
+  );
   return {
     ...result,
     ...fields,
-    errorMessage: `${fields.errorMessage} The limit ran out mid-run, so the issue needs a review. OpenCode said: ${result.errorMessage ?? "(no message)"}`,
+    executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    errorMessage: `${fields.errorMessage} The limit ran out mid-run; the retry resumes the same OpenCode session. OpenCode said: ${result.errorMessage ?? "(no message)"}`,
   };
 }
 

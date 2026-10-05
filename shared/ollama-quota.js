@@ -149,5 +149,6 @@ export async function getQuotaWindows() {
 export const quotaConfigDoc = `- \`env.OLLAMA_API_KEY\`: the Ollama Cloud key, ideally a secret reference. Falls back to the container env.
 - A limit found spent before the harness starts is retried 2 minutes after its reset (sessions every 5 hours
   from the Unix epoch, weeks at Monday 00:00 UTC, the same for every account).
-- A limit that runs out in the middle of a run blocks the issue for review, because the harness may have
-  half-finished actions.`;
+- A limit that runs out in the middle of a run is also retried at the reset: the result reports
+  bootstrap evidence so Paperclip does not block the issue, and the retry resumes the kept harness
+  session. This is a deliberate trade-off: the evidence is not literally true for a run that worked.`;

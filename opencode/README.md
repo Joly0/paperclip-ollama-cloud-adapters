@@ -61,8 +61,11 @@ still spent within 30 minutes after a reset, the adapter retries 15 minutes late
 waiting a whole window.
 
 Paperclip retries a failed run twice, then blocks the issue. A limit that runs out in the middle of
-a run blocks the issue for review like an ordinary failure, because OpenCode may have
-half-finished actions; the adapter can only prove that nothing started before the run.
+a run is retried at the reset as well. Paperclip normally blocks a failed run unless the adapter
+proves that no work started, so for this case the adapter reports that evidence although OpenCode
+has worked. This is a deliberate trade-off: a limit stops OpenCode at its next model request, after
+earlier tool calls have finished, and the retry resumes the same OpenCode session instead of
+replaying anything. Without it, every mid-run limit hit would need a manual comment to continue.
 
 The costs page shows both meters with their reset times.
 
