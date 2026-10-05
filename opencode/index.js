@@ -156,7 +156,7 @@ async function testEnvironment(rawCtx) {
 
 // OpenCode's own model list, narrowed to Ollama Cloud models the server still
 // serves (OpenCode's catalogue lags behind and keeps retired models).
-async function listModels() {
+async function fetchModels() {
   const all = await oc.listOpenCodeModels();
   const cloud = all.filter((m) => m.id.startsWith(MODEL_PREFIX));
   try {
@@ -169,6 +169,25 @@ async function listModels() {
   }
   return cloud;
 }
+
+// Paperclip reads the static `models` field for the adapter's model count and
+// as a fallback list, so it serves the last fetched list. It starts with the
+// models Ollama Cloud served when this version was released and is refreshed
+// in the background on load and on every model-list request.
+const FALLBACK_MODEL_IDS = [
+  "deepseek-v4-pro:0813", "deepseek-v4.1-flash", "gemma4:31b", "glm-5.2", "glm-5.3", "glm-5.3-flash",
+  "gpt-oss:20b", "gpt-oss:120b", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "minimax-m2.7", "minimax-m3",
+  "mistral-large-3:675b", "nemotron-3-nano:30b", "nemotron-3-super", "nemotron-3-ultra",
+];
+let cachedModels = FALLBACK_MODEL_IDS.map((id) => ({ id: `${MODEL_PREFIX}${id}`, label: `${MODEL_PREFIX}${id}` }));
+
+async function listModels() {
+  const models = await fetchModels();
+  if (models.length > 0) cachedModels = models;
+  return models;
+}
+
+listModels().catch(() => {});
 
 const agentConfigurationDoc = `# ${TYPE} agent configuration
 
@@ -211,7 +230,9 @@ export function createServerAdapter() {
     syncSkills: oc.syncOpenCodeSkills,
     sessionCodec: oc.sessionCodec,
     sessionManagement: adapterUtils.getAdapterSessionManagement?.("opencode_local") ?? undefined,
-    models: [{ id: `${MODEL_PREFIX}glm-5.3`, label: `${MODEL_PREFIX}glm-5.3` }],
+    get models() {
+      return cachedModels;
+    },
     listModels,
     getQuotaWindows,
     supportsLocalAgentJwt: true,
