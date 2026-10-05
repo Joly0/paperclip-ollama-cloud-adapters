@@ -49,7 +49,19 @@ function failedResult(errorMessage, errorCode) {
   return { exitCode: 1, signal: null, timedOut: false, errorMessage, errorCode };
 }
 
-async function execute(ctx) {
+// Paperclip's agent form stores the thinking-effort choice as `variant` only
+// for opencode_local; for any other adapter type it uses `effort`. OpenCode
+// reads `variant`, so carry the form's value over unless `variant` is set.
+function withOpenCodeConfig(ctx) {
+  const config = ctx.config ?? {};
+  const effort = typeof config.effort === "string" ? config.effort.trim() : "";
+  const variant = typeof config.variant === "string" ? config.variant.trim() : "";
+  if (!effort || variant) return ctx;
+  return { ...ctx, config: { ...config, variant: effort } };
+}
+
+async function execute(rawCtx) {
+  const ctx = withOpenCodeConfig(rawCtx);
   const model = String(ctx.config?.model ?? "").trim();
   if (!model.startsWith(MODEL_PREFIX)) {
     return failedResult(
@@ -110,7 +122,8 @@ async function execute(ctx) {
 // out (60 s) and reports a misleading timeout. In that case the other checks
 // still run, the probe is cut to 1 s and its result is replaced by a limit
 // warning.
-async function testEnvironment(ctx) {
+async function testEnvironment(rawCtx) {
+  const ctx = withOpenCodeConfig(rawCtx);
   const apiKey = apiKeyFor(ctx.config);
   if (!apiKey) {
     return {
@@ -162,6 +175,8 @@ const agentConfigurationDoc = `# ${TYPE} agent configuration
 Runs OpenCode on Ollama Cloud. Same fields as opencode_local, with these differences:
 
 - \`model\` must start with \`${MODEL_PREFIX}\` (e.g. \`${MODEL_PREFIX}glm-5.3\`).
+- \`effort\` (the agent form's thinking effort for this adapter type) is passed to OpenCode as \`variant\`
+  unless \`variant\` is set.
 ${quotaConfigDoc}
 
 Ollama Cloud serialises concurrent sessions on one model, so give parallel agents different models.
@@ -169,6 +184,22 @@ Ollama Cloud serialises concurrent sessions on one model, so give parallel agent
 ---
 
 ${ocMeta.agentConfigurationDoc ?? ""}`;
+
+// Fields the generic agent form shows for this adapter. Model, thinking effort,
+// env (with secret references), command, extra args, timeout and grace period
+// come from the form itself; this adds what opencode_local's own form has.
+// Unset means on, matching opencode_local's runtime default.
+const configSchema = {
+  fields: [
+    {
+      key: "dangerouslySkipPermissions",
+      label: "Skip permissions",
+      type: "toggle",
+      default: true,
+      hint: "Allow OpenCode to access directories outside the workspace without asking. Unattended runs cannot answer permission prompts.",
+    },
+  ],
+};
 
 export function createServerAdapter() {
   return {
@@ -188,5 +219,6 @@ export function createServerAdapter() {
     instructionsPathKey: "instructionsFilePath",
     requiresMaterializedRuntimeSkills: true,
     agentConfigurationDoc,
+    getConfigSchema: () => configSchema,
   };
 }

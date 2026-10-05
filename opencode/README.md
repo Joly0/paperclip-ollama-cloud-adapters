@@ -22,6 +22,19 @@ cannot be fetched, the unfiltered OpenCode list is shown.
 Runs are reported with biller `ollama-cloud` and billing type `subscription_included`, because they
 are paid by the Ollama subscription rather than a connected provider account.
 
+## Agent settings
+
+The agent form shows Paperclip's generic local-adapter settings: model, thinking effort,
+environment variables including Paperclip secret references, command and extra args under
+Advanced, and timeout and interrupt grace period. One adapter field is added: 'Skip permissions'
+(`adapterConfig` key `dangerouslySkipPermissions`, default on; unset counts as on, like
+`opencode_local`). It lets OpenCode access directories outside the workspace without asking, since
+unattended runs cannot answer permission prompts.
+
+Thinking effort: for adapter types other than `opencode_local`, the form stores the choice as
+`effort` and offers its generic level list. The adapter passes `effort` to OpenCode as `variant`
+unless `variant` is set. Whether a level has an effect depends on the model.
+
 ## Usage limits
 
 Before each run the adapter checks `https://ollama.com/api/usage`. If the 5 hour session limit or
@@ -61,9 +74,8 @@ In the Paperclip UI, open the instance settings, then Adapters, and install the 
     @joly0/paperclip-adapter-opencode-ollama-cloud
 
 To update to a newer version, use Reinstall. Then pick the adapter `opencode_ollama_cloud` for an
-agent and choose a model. The agent form has no env field for external adapters: either set
-`OLLAMA_API_KEY` in the container env, or add `env.OLLAMA_API_KEY` to the agent's `adapterConfig`
-through the API as a secret reference.
+agent and choose a model. Set `OLLAMA_API_KEY` in the agent's environment variables, ideally as a
+Paperclip secret reference, or in the container env.
 
 Ollama Cloud serialises concurrent sessions on one model, so give parallel agents different models.
 
