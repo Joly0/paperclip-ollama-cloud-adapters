@@ -40,8 +40,10 @@ concurrency:
 
 jobs:
   publish:
-    # GitHub-hosted runner. Any Linux image with bash works.
-    runs-on: ubuntu-latest
+    # GitHub-hosted runner, pinned so a change of the ubuntu-latest label
+    # (Ubuntu 26 from 2026-10-19) cannot change the build unannounced.
+    # Raise it deliberately when 24.04 is retired; any Linux image with bash works.
+    runs-on: ubuntu-24.04
     # Package directory used by every step below.
     # Copy this workflow for another harness and change only this and the paths.
     defaults:
