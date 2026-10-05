@@ -1,0 +1,93 @@
+# ---------------------------------------------------------------------------
+# Publish the OpenCode adapter to npm
+# ---------------------------------------------------------------------------
+# Publishes opencode/ as @joly0/paperclip-adapter-opencode-ollama-cloud
+# whenever a push to main changes it, but only when its package.json version
+# is not on npm yet. A release is therefore just a version bump; ordinary
+# commits run the checks and skip the publish.
+
+# Name shown in the Actions tab.
+# Change it only to tell this workflow apart from the other harnesses'.
+name: Publish opencode adapter
+
+on:
+  # Run on pushes to main that touch this adapter or the shared code it bundles.
+  # Add paths here if the package starts bundling other shared files.
+  # Narrow paths mean fewer runs; a missing path means a change never ships.
+  push:
+    branches: [main]
+    paths:
+      - "opencode/**"
+      - "shared/**"
+      - ".github/workflows/publish-opencode.yml"
+  # Manual run from the Actions tab, e.g. to retry a failed publish.
+  # Harmless to keep: it still skips versions that are already published.
+  workflow_dispatch:
+
+# Least privilege for the job's GITHUB_TOKEN.
+# id-token: write lets npm trusted publishing exchange a GitHub OIDC token
+# for a short-lived npm credential, so no long-lived npm token is stored.
+# Remove it only if you switch to the NPM_TOKEN secret below for good.
+permissions:
+  contents: read
+  id-token: write
+
+# Never run two publishes of this package at once; a newer push waits.
+# Cancelling instead could leave a half-finished publish, so keep it false.
+concurrency:
+  group: publish-opencode
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # GitHub-hosted runner. Any Linux image with bash works.
+    runs-on: ubuntu-latest
+    # Package directory used by every step below.
+    # Copy this workflow for another harness and change only this and the paths.
+    defaults:
+      run:
+        working-directory: opencode
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 24 ships npm 11, which trusted publishing needs (npm 11.5.1 or newer).
+      # registry-url writes the .npmrc that npm publish uses.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # The repo keeps one copy of the limit logic in shared/; opencode/ only
+      # has a symlink to it, which npm would not pack. Replace it with the file.
+      - name: Bundle shared code
+        run: |
+          rm ollama-quota.js
+          cp ../shared/ollama-quota.js ollama-quota.js
+
+      # Catches syntax errors before anything is published. It cannot load the
+      # adapter itself: that needs the Paperclip image's /app/packages sources.
+      - name: Syntax check
+        run: node --check index.js && node --check ollama-quota.js
+
+      - name: Check whether this version is already on npm
+        id: version
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already published, skipping"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publishing $name@$version"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Trusted publishing (OIDC) is used once the package's npm settings name
+      # this repo and workflow. NPM_TOKEN is only the fallback for the very
+      # first publish, before the package exists on npm; delete the secret
+      # afterwards. Provenance comes from publishConfig in package.json.
+      - name: Publish
+        if: steps.version.outputs.publish == 'true'
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
