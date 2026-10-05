@@ -35,6 +35,19 @@ Thinking effort: for adapter types other than `opencode_local`, the form stores 
 `effort` and offers its generic level list. The adapter passes `effort` to OpenCode as `variant`
 unless `variant` is set. Whether a level has an effect depends on the model.
 
+## Run view
+
+OpenCode prints its progress as JSON events. The package ships a transcript parser
+(`ui-parser.cjs`, a port of Paperclip's built-in `opencode_local` parser, declared through
+`exports["./ui-parser"]` and `paperclip.adapterUiParser` in `package.json`), so the run view shows
+assistant text, reasoning, tool calls with their results and per-step token usage instead of raw
+JSON.
+
+The adapter also reports a `tool_call` or `assistant` run event for each matching OpenCode event,
+so the live line on the task page shows the current tool or the last assistant text. Paperclip's
+built-in `opencode_local` adapter does not report these. Paperclip keeps the live line in memory
+for about 90 seconds and does not store it; the transcript is the history.
+
 ## Usage limits
 
 Before each run the adapter checks `https://ollama.com/api/usage`. If the 5 hour session limit or

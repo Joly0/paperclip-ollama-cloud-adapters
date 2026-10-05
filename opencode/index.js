@@ -52,6 +52,63 @@ function failedResult(errorMessage, errorCode) {
 // Paperclip's agent form stores the thinking-effort choice as `variant` only
 // for opencode_local; for any other adapter type it uses `effort`. OpenCode
 // reads `variant`, so carry the form's value over unless `variant` is set.
+// The task page's live line ("Using <tool>", last assistant text) comes from
+// run events that adapters report through ctx.onEvent; OpenCode's built-in
+// adapter reports none. This passes every chunk on to ctx.onLog unchanged and
+// reports a `tool_call` or `assistant` event for each complete OpenCode JSON
+// line, the same pattern Paperclip's kimi_local adapter uses.
+function openCodeLiveEvents(line) {
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  const part = event && typeof event.part === "object" && event.part !== null ? event.part : {};
+  if (event?.type === "tool_use" && typeof part.tool === "string" && part.tool) {
+    return [{ eventType: "tool_call", payload: { toolName: part.tool } }];
+  }
+  if (event?.type === "text" && typeof part.text === "string" && part.text.trim()) {
+    const content = part.text.trim();
+    return [{ eventType: "assistant", message: content, payload: { content } }];
+  }
+  return [];
+}
+
+function createLiveEventLog(onLog, onEvent) {
+  if (!onEvent) return { log: onLog, flush: async () => {} };
+  let buffer = "";
+  const emitLine = async (raw) => {
+    const line = raw.trim();
+    if (!line) return;
+    for (const event of openCodeLiveEvents(line)) {
+      try {
+        await onEvent({ stream: "stdout", ...event });
+      } catch {
+        // Live status is cosmetic; never let it fail the run.
+      }
+    }
+  };
+  return {
+    log: async (stream, chunk) => {
+      await onLog(stream, chunk);
+      if (stream !== "stdout") return;
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        await emitLine(line);
+      }
+    },
+    flush: async () => {
+      const rest = buffer;
+      buffer = "";
+      await emitLine(rest);
+    },
+  };
+}
+
 function withOpenCodeConfig(ctx) {
   const config = ctx.config ?? {};
   const effort = typeof config.effort === "string" ? config.effort.trim() : "";
@@ -95,8 +152,15 @@ async function execute(rawCtx) {
 
   // OpenCode guesses the biller from the env and picks OpenRouter whenever
   // OPENROUTER_API_KEY is set; these runs are paid by the Ollama subscription.
+  const live = createLiveEventLog(ctx.onLog, ctx.onEvent);
+  let executed;
+  try {
+    executed = await oc.execute({ ...ctx, onLog: live.log });
+  } finally {
+    await live.flush();
+  }
   const result = {
-    ...(await oc.execute(ctx)),
+    ...executed,
     biller: "ollama-cloud",
     billingType: "subscription_included",
   };
