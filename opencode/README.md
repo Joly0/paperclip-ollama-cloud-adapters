@@ -20,20 +20,83 @@ serves: OpenCode's own catalogue lags behind and keeps retired models. If the se
 cannot be fetched, the unfiltered OpenCode list is shown.
 
 Runs are reported with biller `ollama-cloud` and billing type `subscription_included`, because they
-are paid by the Ollama subscription rather than a connected provider account.
+are paid by the Ollama subscription rather than a connected provider account. A run that starts
+while a limit is spent and goes on to prepaid usage credits is labelled billing type `credits`
+instead (see Usage limits).
 
 ## Agent settings
 
 The agent form shows Paperclip's generic local-adapter settings: model, thinking effort,
 environment variables including Paperclip secret references, command and extra args under
-Advanced, and timeout and interrupt grace period. One adapter field is added: 'Skip permissions'
-(`adapterConfig` key `dangerouslySkipPermissions`, default on; unset counts as on, like
-`opencode_local`). It lets OpenCode access directories outside the workspace without asking, since
-unattended runs cannot answer permission prompts.
+Advanced, and timeout and interrupt grace period. The adapter adds these fields of its own.
 
-Thinking effort: for adapter types other than `opencode_local`, the form stores the choice as
-`effort` and offers its generic level list. The adapter passes `effort` to OpenCode as `variant`
-unless `variant` is set. Whether a level has an effect depends on the model.
+- 'Skip permissions' (`adapterConfig` key `dangerouslySkipPermissions`, default on; unset counts as
+  on, like `opencode_local`). It lets OpenCode access directories outside the workspace without
+  asking, since unattended runs cannot answer permission prompts.
+- 'Reasoning effort' (`reasoningEffort`, default High; other choices Max, Medium, Low and Auto).
+  The choice is mapped to the nearest reasoning variant the chosen model offers; a tie goes to the
+  higher one, and a model that offers no variants gets no variant sent. Auto sends nothing and
+  leaves reasoning to the server default. An explicit `variant` set through the API wins over this
+  field. The form's own Thinking effort field is ignored. Whether a level has an effect depends on
+  the model: GLM, Kimi and DeepSeek have no Medium, Gemma, gpt-oss and Nemotron have no Max, and
+  Low degrades some GLM models.
+- 'Keep running on usage credits' (`keepRunningOnCredits`, default off). Your Ollama plan has a
+  5 hour session limit and a weekly limit; when one is used up, Ollama charges further requests to
+  your prepaid usage credits, which are paid per token and listed with their cost in the Ollama
+  dashboard. Off: the agent waits for the limit to reset and never spends credits. On: it keeps
+  working and spends credits; if they run out, the run is retried after the reset. See Usage
+  limits.
+- 'Raise OpenCode's output cap' (`raiseOutputCap`, default on). Sets
+  `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` in the run's env; a value already in the agent env
+  wins. 'Output cap (tokens)' (`outputTokenCap`) only applies when the cap is raised and overrides
+  the automatic value; empty means auto: the model's own output limit, at most 131072 and at most
+  half its context. Off keeps OpenCode's 32000-token cap, which also limits how much one runaway
+  reply can cost.
+- 'Compact long sessions' (`compaction`, default off). Off keeps OpenCode's default, which
+  compacts only when the context is nearly full (around 900k tokens on most of these models). On:
+  the session is summarised once it passes the size set by 'Compact at (tokens)'
+  (`compactAtTokens`, default 200000, minimum 50000; fresh sessions start around 30k tokens, long
+  runs reach 200k to 400k; lower saves more and forgets more). The setting works by giving the
+  model an input limit so OpenCode's own compaction trigger fires there. After a compaction
+  OpenCode keeps working only when the model was still mid-task. Each resumed run resends the
+  whole session, so a smaller session costs less on every request, at the price of detail from
+  earlier turns.
+- 'Prune old tool outputs' (`pruneToolOutputs`, default off). OpenCode's prune option: drops the
+  output of old tool calls (file reads, build logs) from the session. Saves tokens on long runs;
+  the agent has to re-read a file it needs again.
+- 'Loop guard' (`loopGuard`, default on) and 'Loop guard: identical calls in a row'
+  (`loopGuardRepeats`, default 3, minimum 2). The call that would make this many identical calls in
+  a row (same tool, same arguments) is refused, and the refusal returns to the model as the tool's
+  error, so it can change approach or report the blocker. Ordinary edit and test cycles are not
+  affected.
+
+## Usage controls
+
+The settings above exist because unattended runs on Ollama Cloud models can spend a lot without
+anyone watching. They apply to the run only; nothing global changes.
+
+OpenCode 1.18 cuts every reply at 32000 tokens. A long reasoning reply that hits the cap ends the run
+without a result, so the reasoning is paid for and the work has to be started again; raising the
+output cap removes that ceiling. The 'Auto' choice of Reasoning effort is the other extreme: it sends no
+variant, leaves reasoning to the server default, and that default has produced 32k-token replies of
+pure reasoning with noticeably higher usage.
+
+Every resumed run resends the whole session, so a smaller session costs less on every request.
+Compaction summarises the session at the chosen size and pruning drops old tool outputs; both
+trade detail from earlier turns for lower usage.
+
+The loop guard exists because a model can get stuck repeating the same tool call and burn quota on
+calls that cannot give a different result; the guard refuses those calls and returns an error to
+the model instead. The compaction stop keeps OpenCode from spending extra requests on a pointless
+continuation after a compaction that followed the model's final answer. Both guards live in
+guards.js, an OpenCode plugin the adapter installs. OpenCode 1.18 ignores file:// plugin entries in
+its config, so the adapter writes the file directly into OpenCode's config folder as
+plugins/paperclip-guards.js (`$XDG_CONFIG_HOME/opencode`, by default `~/.config/opencode`).
+Paperclip copies that folder into each run, so OpenCode loads the guards from there. Each guard is
+inert unless the run's env enables it, which keeps them per-agent settings.
+
+Each run's stderr starts with one `[ollama-cloud] <model>: ...` line listing the applied settings,
+so the transcript shows what was in effect.
 
 ## Run view
 
@@ -53,6 +116,15 @@ for about 90 seconds and does not store it; the transcript is the history.
 Before each run the adapter checks `https://ollama.com/api/usage`. If the 5 hour session limit or
 the weekly limit is spent, OpenCode is not started: the run ends as `provider_quota` with proof
 that no provider work started, and Paperclip schedules a retry 2 minutes after the next reset.
+This is the behaviour with 'Keep running on usage credits' off.
+
+With 'Keep running on usage credits' on, a spent limit does not stop the run: OpenCode starts
+anyway, Ollama bills its requests to the account's prepaid usage credits, and a run that starts on
+a spent limit is labelled billing type `credits` instead of `subscription_included`.
+`https://ollama.com/api/usage` keeps reporting the limit as spent while credits are used and shows
+no balance. With credits on, a failure is not proof that a limit is spent, so a failed run is
+treated as a limit only when the error looks like a refused request: HTTP 429, rate limit, quota,
+credit, payment and similar messages.
 
 The reset times are computed, because Ollama's API does not report them. The resets are global, the
 same moment for every account: the session meter resets whenever `unix time % 18000 == 0` (every
@@ -71,7 +143,8 @@ The costs page shows both meters with their reset times.
 
 The environment test normally runs OpenCode's hello probe. With a spent limit, that probe retries
 HTTP 429 until it times out and reports a misleading timeout, so the test replaces its result with
-a limit warning and keeps the other checks.
+a limit warning and keeps the other checks. With credits on, the probe runs as usual and the test
+adds an info check noting that runs use usage credits until the limit resets.
 
 ## Requirements
 

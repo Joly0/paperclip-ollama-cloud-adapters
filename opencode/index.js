@@ -22,6 +22,9 @@ const {
   retryAt,
   spentMeter,
 } = await import(new URL(`./ollama-quota.js${new URL(import.meta.url).search}`, import.meta.url).href);
+const { applyRunSettings, runSettingsFields } = await import(
+  new URL(`./run-settings.js${new URL(import.meta.url).search}`, import.meta.url).href
+);
 
 const TYPE = "opencode_ollama_cloud";
 const MODEL_PREFIX = "ollama-cloud/";
@@ -45,13 +48,22 @@ const oc = await importAppPackage(openCodePkg, "./server");
 const ocMeta = await importAppPackage(openCodePkg, ".");
 const adapterUtils = await importAppPackage(path.join(APP_DIR, "packages/adapter-utils"), ".");
 
+// Once a plan limit is spent, Ollama bills further requests to the account's
+// prepaid usage credits; /api/usage still reports the limit as spent and shows
+// no balance. Agents with this setting keep running on those credits.
+function usesCredits(config) {
+  const value = config?.keepRunningOnCredits;
+  return value === true || value === "true";
+}
+
+// With credits a failure is not proof of a spent limit, so only an error that
+// looks like a refused request (credits used up) is treated as one.
+const LIMIT_ERROR = /\b429\b|rate.?limit|quota|credit|usage limit|insufficient|payment|billing/i;
+
 function failedResult(errorMessage, errorCode) {
   return { exitCode: 1, signal: null, timedOut: false, errorMessage, errorCode };
 }
 
-// Paperclip's agent form stores the thinking-effort choice as `variant` only
-// for opencode_local; for any other adapter type it uses `effort`. OpenCode
-// reads `variant`, so carry the form's value over unless `variant` is set.
 // The task page's live line ("Using <tool>", last assistant text) comes from
 // run events that adapters report through ctx.onEvent; OpenCode's built-in
 // adapter reports none. This passes every chunk on to ctx.onLog unchanged and
@@ -109,16 +121,14 @@ function createLiveEventLog(onLog, onEvent) {
   };
 }
 
-function withOpenCodeConfig(ctx) {
-  const config = ctx.config ?? {};
-  const effort = typeof config.effort === "string" ? config.effort.trim() : "";
-  const variant = typeof config.variant === "string" ? config.variant.trim() : "";
-  if (!effort || variant) return ctx;
-  return { ...ctx, config: { ...config, variant: effort } };
+// Reasoning effort, output cap, compaction and loop guard (run-settings.js).
+async function withRunSettings(ctx) {
+  const { config, note } = await applyRunSettings(ctx.config ?? {});
+  return { ctx: { ...ctx, config }, note };
 }
 
 async function execute(rawCtx) {
-  const ctx = withOpenCodeConfig(rawCtx);
+  const { ctx, note } = await withRunSettings(rawCtx);
   const model = String(ctx.config?.model ?? "").trim();
   if (!model.startsWith(MODEL_PREFIX)) {
     return failedResult(
@@ -134,9 +144,12 @@ async function execute(rawCtx) {
     );
   }
 
+  const credits = usesCredits(ctx.config);
   const usage = await fetchUsage(apiKey);
   const before = spentMeter(usage);
-  if (before) {
+  if (before && credits) {
+    await ctx.onLog("stderr", `[ollama-cloud] The ${before} limit is spent; this run uses usage credits.\n`);
+  } else if (before) {
     const fields = quotaFields(before, Boolean(usage?.simulated));
     await ctx.onLog("stderr", `[ollama-cloud] ${fields.errorMessage} OpenCode was not started.\n`);
     // Without this evidence Paperclip treats the run as possibly having acted
@@ -152,6 +165,7 @@ async function execute(rawCtx) {
 
   // OpenCode guesses the biller from the env and picks OpenRouter whenever
   // OPENROUTER_API_KEY is set; these runs are paid by the Ollama subscription.
+  await ctx.onLog("stderr", `${note}\n`);
   const live = createLiveEventLog(ctx.onLog, ctx.onEvent);
   let executed;
   try {
@@ -162,7 +176,7 @@ async function execute(rawCtx) {
   const result = {
     ...executed,
     biller: "ollama-cloud",
-    billingType: "subscription_included",
+    billingType: before && credits ? "credits" : "subscription_included",
   };
   const failed = result.exitCode !== 0 || result.timedOut || Boolean(result.errorMessage);
   if (!failed || ctx.signal?.aborted || result.errorFamily === "provider_quota") return result;
@@ -181,6 +195,7 @@ async function execute(rawCtx) {
   const afterUsage = await fetchUsage(apiKey);
   const after = spentMeter(afterUsage);
   if (!after) return result;
+  if (credits && !LIMIT_ERROR.test(String(result.errorMessage ?? ""))) return result;
   const fields = quotaFields(after, Boolean(afterUsage?.simulated));
   await ctx.onLog(
     "stderr",
@@ -199,7 +214,7 @@ async function execute(rawCtx) {
 // still run, the probe is cut to 1 s and its result is replaced by a limit
 // warning.
 async function testEnvironment(rawCtx) {
-  const ctx = withOpenCodeConfig(rawCtx);
+  const { ctx } = await withRunSettings(rawCtx);
   const apiKey = apiKeyFor(ctx.config);
   if (!apiKey) {
     return {
@@ -217,6 +232,15 @@ async function testEnvironment(rawCtx) {
   const usage = await fetchUsage(apiKey);
   const meter = spentMeter(usage);
   if (!meter) return oc.testEnvironment(ctx);
+  if (usesCredits(ctx.config)) {
+    const result = await oc.testEnvironment(ctx);
+    const checks = [...result.checks, {
+      code: "ollama_cloud_on_credits",
+      level: "info",
+      message: `Ollama Cloud ${meter} limit is spent; runs use usage credits until it resets.`,
+    }];
+    return { ...result, adapterType: TYPE, checks };
+  }
 
   const result = await oc.testEnvironment({ ...ctx, config: { ...ctx.config, helloProbeTimeoutSec: 1 } });
   const checks = result.checks.filter((check) => !check.code.startsWith("opencode_hello_probe"));
@@ -270,8 +294,14 @@ const agentConfigurationDoc = `# ${TYPE} agent configuration
 Runs OpenCode on Ollama Cloud. Same fields as opencode_local, with these differences:
 
 - \`model\` must start with \`${MODEL_PREFIX}\` (e.g. \`${MODEL_PREFIX}glm-5.3\`).
-- \`effort\` (the agent form's thinking effort for this adapter type) is passed to OpenCode as \`variant\`
-  unless \`variant\` is set.
+- \`reasoningEffort\` (high, max, medium, low or auto; default high) is mapped to the nearest variant the model
+  offers and passed to OpenCode as \`--variant\`. A non-empty \`variant\` wins; the form's \`effort\` is ignored.
+- \`raiseOutputCap\` (default true) and \`outputTokenCap\` (empty means the model's output limit, at most 131072 and
+  half its context) set \`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX\` unless the agent env sets it.
+- \`compaction\` (default false) and \`compactAtTokens\` (default 200000) make OpenCode compact at that session size;
+  \`pruneToolOutputs\` (default false) sets OpenCode's \`compaction.prune\`.
+- \`keepRunningOnCredits\` (default false) keeps running on prepaid usage credits once a plan limit is spent.
+- \`loopGuard\` (default true) and \`loopGuardRepeats\` (default 3) refuse that many identical tool calls in a row.
 ${quotaConfigDoc}
 
 Ollama Cloud serialises concurrent sessions on one model, so give parallel agents different models.
@@ -280,10 +310,11 @@ Ollama Cloud serialises concurrent sessions on one model, so give parallel agent
 
 ${ocMeta.agentConfigurationDoc ?? ""}`;
 
-// Fields the generic agent form shows for this adapter. Model, thinking effort,
-// env (with secret references), command, extra args, timeout and grace period
-// come from the form itself; this adds what opencode_local's own form has.
-// Unset means on, matching opencode_local's runtime default.
+// Fields the generic agent form shows for this adapter. Model, env (with
+// secret references), command, extra args, timeout and grace period come from
+// the form itself (its thinking effort field is ignored, see reasoningEffort).
+// This adds what opencode_local's own form has, plus run-settings.js's fields.
+// Unset skip-permissions means on, matching opencode_local's runtime default.
 const configSchema = {
   fields: [
     {
@@ -293,6 +324,14 @@ const configSchema = {
       default: true,
       hint: "Allow OpenCode to access directories outside the workspace without asking. Unattended runs cannot answer permission prompts.",
     },
+    {
+      key: "keepRunningOnCredits",
+      label: "Keep running on usage credits",
+      type: "toggle",
+      default: false,
+      hint: "Your Ollama plan has a 5-hour session limit and a weekly limit. When one is used up, Ollama charges further requests to your prepaid usage credits (paid per token, listed with their cost in the Ollama dashboard). Off: this agent waits for the limit to reset and never spends credits. On: it keeps working and spends credits; if they run out, the run is retried after the reset.",
+    },
+    ...runSettingsFields,
   ],
 };
 

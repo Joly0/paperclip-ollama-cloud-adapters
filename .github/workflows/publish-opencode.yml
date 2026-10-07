@@ -69,7 +69,7 @@ jobs:
       # Catches syntax errors before anything is published. It cannot load the
       # adapter itself: that needs the Paperclip image's /app/packages sources.
       - name: Syntax check
-        run: node --check index.js && node --check ollama-quota.js && node --check ui-parser.cjs
+        run: node --check index.js && node --check ollama-quota.js && node --check run-settings.js && node --check guards.js && node --check ui-parser.cjs
 
       - name: Check whether this version is already on npm
         id: version
