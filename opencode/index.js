@@ -26,6 +26,8 @@ const {
 const { applyRunSettings, runSettingsFields } = await import(
   new URL(`./run-settings.js${new URL(import.meta.url).search}`, import.meta.url).href
 );
+const keepalive = await import(new URL(`./keepalive.js${new URL(import.meta.url).search}`, import.meta.url).href);
+keepalive.configure({ fetchUsage, spentMeter });
 
 const TYPE = "opencode_ollama_cloud";
 const MODEL_PREFIX = "ollama-cloud/";
@@ -138,16 +140,31 @@ function createLiveEventLog(onLog, onEvent) {
   };
 }
 
-// Reasoning effort, output cap, compaction and loop guard (run-settings.js).
+// Reasoning effort, output cap, compaction, loop guard, where the agent
+// instructions go and the cache keepalive (run-settings.js, keepalive.js).
 async function withRunSettings(ctx) {
   const context = ctx.context ?? {};
   const issue = context.taskId ?? context.issueId;
-  const { config, note } = await applyRunSettings(ctx.config ?? {}, { agentId: ctx.agent?.id, issue });
-  return { ctx: { ...ctx, config }, note };
+  const agentId = ctx.agent?.id;
+  // Same sources opencode_local reads to decide whether a run is remote.
+  const remote = ctx.executionTarget?.kind === "remote" || Boolean(ctx.executionTransport?.remoteExecution);
+  // One cached session per agent and issue, as OpenCode resumes them.
+  const keepaliveKey = agentId && issue ? `${agentId}:${issue}` : null;
+  let proxyBaseUrl = null;
+  let proxyError = keepaliveKey ? null : "run has no issue";
+  if (keepaliveKey && !remote) {
+    try {
+      proxyBaseUrl = await keepalive.baseUrlFor(keepaliveKey);
+    } catch (err) {
+      proxyError = `proxy failed to start: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+  const settings = await applyRunSettings(ctx.config ?? {}, { agentId, issue, remote, proxyBaseUrl, proxyError });
+  return { ctx: { ...ctx, config: settings.config }, note: settings.note, keepaliveKey, keepaliveOptions: settings.keepalive };
 }
 
 async function execute(rawCtx) {
-  const { ctx, note } = await withRunSettings(rawCtx);
+  const { ctx, note, keepaliveKey, keepaliveOptions } = await withRunSettings(rawCtx);
   const model = String(ctx.config?.model ?? "").trim();
   if (!model.startsWith(MODEL_PREFIX)) {
     return failedResult(
@@ -187,12 +204,20 @@ async function execute(rawCtx) {
   // OpenCode guesses the biller from the env and picks OpenRouter whenever
   // OPENROUTER_API_KEY is set; these runs are paid by the Ollama subscription.
   await ctx.onLog("stderr", `${note}\n`);
+  if (keepaliveKey) {
+    const warm = keepalive.beginRun(keepaliveKey);
+    if (warm.pings > 0) {
+      const cached = warm.lastCached == null ? "" : `, the last one read ${warm.lastCached} tokens from cache`;
+      await ctx.onLog("stderr", `[ollama-cloud] Cache kept warm since the last run: ${warm.pings} keepalive ping(s)${cached}.\n`);
+    }
+  }
   const live = createLiveEventLog(ctx.onLog, ctx.onEvent);
   let executed;
   try {
     executed = await oc.execute({ ...ctx, onLog: live.log });
   } finally {
     await live.flush();
+    if (keepaliveKey) keepalive.endRun(keepaliveKey, keepaliveOptions ? { ...keepaliveOptions, apiKey } : null);
   }
   const result = {
     ...executed,

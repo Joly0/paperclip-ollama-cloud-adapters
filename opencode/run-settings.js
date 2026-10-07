@@ -23,6 +23,12 @@ export const DEFAULTS = {
   loopGuard: true,
   loopGuardRepeats: 3,
   stableTempDir: true,
+  instructionsInSystemPrompt: true,
+  // One interval for every model, below the shortest cache lifetime measured
+  // (glm-5.3: 5 to 10 min), so new models need no per-model value.
+  cacheKeepalive: true,
+  keepaliveIntervalMinutes: 4,
+  keepaliveForMinutes: 30,
 };
 
 // Paperclip gives every run a fresh scratch folder (paperclip-run-<issue>-<run>-<random>)
@@ -327,6 +333,56 @@ export async function applyRunSettings(config, run = {}) {
   }
   if (Object.keys(compaction).length > 0) inline.compaction = compaction;
 
+  // Agent instructions. opencode_local prepends the whole AGENTS.md to the
+  // prompt of every wake, resumed sessions included, so each wake adds an
+  // uncached copy to the session. OpenCode's `instructions` option puts the
+  // file into the system prompt instead: cached with the tool definitions,
+  // never repeated, kept across compaction. A remote run cannot read a local
+  // path, and a relative path is resolved by opencode_local against the run's
+  // cwd, so both keep the prepended copy, as does an unreadable file.
+  const instructionsFile = String(config.instructionsFilePath ?? "").trim();
+  if (instructionsFile && asBool(config.instructionsInSystemPrompt, DEFAULTS.instructionsInSystemPrompt)) {
+    if (run.remote) {
+      notes.push("instructions prepended to the prompt (remote run)");
+    } else if (!path.isAbsolute(instructionsFile)) {
+      notes.push("instructions prepended to the prompt (relative path)");
+    } else {
+      try {
+        fs.accessSync(instructionsFile, fs.constants.R_OK);
+        const listed = Array.isArray(inline.instructions) ? inline.instructions : [];
+        inline.instructions = [...listed, instructionsFile];
+        next.instructionsFilePath = "";
+        notes.push("instructions in the system prompt");
+      } catch {
+        notes.push("instructions prepended to the prompt (file not readable)");
+      }
+    }
+  }
+
+  // Cache keepalive: OpenCode talks to Ollama through the adapter's local
+  // proxy (keepalive.js), which replays the last request between wakes.
+  let keepalive = null;
+  if (asBool(config.cacheKeepalive, DEFAULTS.cacheKeepalive)) {
+    const interval = asPositiveInt(config.keepaliveIntervalMinutes) ?? DEFAULTS.keepaliveIntervalMinutes;
+    const forMinutes = Math.max(interval, asPositiveInt(config.keepaliveForMinutes) ?? DEFAULTS.keepaliveForMinutes);
+    const custom = inline.provider?.["ollama-cloud"]?.options?.baseURL;
+    if (run.remote) {
+      notes.push("cache keepalive off (remote run)");
+    } else if (custom) {
+      notes.push("cache keepalive off (the agent sets its own ollama-cloud baseURL)");
+    } else if (!run.proxyBaseUrl) {
+      notes.push(`cache keepalive off (${run.proxyError ?? "proxy not running"})`);
+    } else {
+      const provider = { ...(inline.provider ?? {}) };
+      const cloud = { ...(provider["ollama-cloud"] ?? {}) };
+      cloud.options = { ...(cloud.options ?? {}), baseURL: run.proxyBaseUrl };
+      provider["ollama-cloud"] = cloud;
+      inline.provider = provider;
+      keepalive = { intervalMinutes: interval, forMinutes };
+      notes.push(`cache keepalive every ${interval} min for up to ${forMinutes} min`);
+    }
+  }
+
   if (asBool(config.loopGuard, DEFAULTS.loopGuard)) {
     const repeats = Math.max(2, asPositiveInt(config.loopGuardRepeats) ?? DEFAULTS.loopGuardRepeats);
     guardEnv.PAPERCLIP_LOOP_GUARD_REPEATS = String(repeats);
@@ -346,7 +402,7 @@ export async function applyRunSettings(config, run = {}) {
 
   if (Object.keys(inline).length > 0) env.OPENCODE_CONFIG_CONTENT = JSON.stringify(inline);
   next.env = env;
-  return { config: next, note: `[ollama-cloud] ${modelId}: ${notes.join("; ")}.` };
+  return { config: next, note: `[ollama-cloud] ${modelId}: ${notes.join("; ")}.`, keepalive };
 }
 
 export const runSettingsFields = [
@@ -356,6 +412,34 @@ export const runSettingsFields = [
     type: "toggle",
     default: DEFAULTS.stableTempDir,
     hint: "Paperclip gives every run a new temporary folder and removes it when the run ends. OpenCode puts that folder's path into the bash tool's description near the start of every request, so a new path on each wake made Ollama's prompt cache miss for the whole resumed session. On shows the model a fixed link per agent and issue that points at the current run's folder instead. The temporary folder and its cleanup stay exactly as Paperclip handles them.",
+  },
+  {
+    key: "instructionsInSystemPrompt",
+    label: "Agent instructions in the system prompt",
+    type: "toggle",
+    default: DEFAULTS.instructionsInSystemPrompt,
+    hint: "Paperclip pastes the agent's whole AGENTS.md in front of every wake message, also when a session is resumed, so each wake adds another uncached copy to the session. On hands the file to OpenCode as a system instruction instead: it is read fresh on every run, cached with the tool definitions, never repeated and kept across compaction. Off restores Paperclip's behaviour. Remote runs always use Paperclip's behaviour.",
+  },
+  {
+    key: "cacheKeepalive",
+    label: "Keep the prompt cache warm between wakes",
+    type: "toggle",
+    default: DEFAULTS.cacheKeepalive,
+    hint: "Ollama drops a cached prompt after a few minutes (about 5 to 10 for glm-5.3, 15 for deepseek-v4.1-flash, 30 to 60 for kimi-k3), so a wake that comes later resends the whole session uncached. On sends OpenCode's requests through a local proxy in Paperclip that remembers the last one and repeats it between runs with a one-token reply, which costs almost nothing because it is read from the cache. Pings stop when the next run on the issue starts, after the time below, when a plan limit is spent (they never use usage credits) or when one fails. Off sends requests straight to Ollama.",
+  },
+  {
+    key: "keepaliveIntervalMinutes",
+    label: "Keepalive interval (minutes)",
+    type: "number",
+    default: DEFAULTS.keepaliveIntervalMinutes,
+    hint: "Minutes between pings. The default of 4 stays below the shortest cache lifetime measured on any model. Raise it only for a model known to keep its cache longer: fewer requests, but a value above the model's lifetime makes every ping a full uncached request.",
+  },
+  {
+    key: "keepaliveForMinutes",
+    label: "Keepalive for at most (minutes)",
+    type: "number",
+    default: DEFAULTS.keepaliveForMinutes,
+    hint: "How long after a run the cache is kept warm when no new run on the issue starts. Longer helps issues that wait for a review or a reply; each extra interval is one more ping, also for issues that are already done.",
   },
   {
     key: "reasoningEffort",

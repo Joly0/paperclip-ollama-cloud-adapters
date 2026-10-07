@@ -1,6 +1,6 @@
 {
   "name": "@joly0/paperclip-adapter-opencode-ollama-cloud",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "description": "Paperclip adapter that runs OpenCode on Ollama Cloud models and retries issues right after a spent session or weekly limit resets.",
   "type": "module",
   "main": "./index.js",
@@ -16,6 +16,7 @@
     "ollama-quota.js",
     "run-settings.js",
     "guards.js",
+    "keepalive.js",
     "ui-parser.cjs",
     "README.md"
   ],

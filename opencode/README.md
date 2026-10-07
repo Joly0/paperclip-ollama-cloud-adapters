@@ -42,6 +42,30 @@ Advanced, and timeout and interrupt grace period. The adapter adds these fields 
   cleanup are unchanged. If another run on the same issue still uses the link, the new run keeps
   the per-run path. Links whose folder is gone are removed after a day. Measured in Paperclip: a
   resumed run's first request went from about 8k of 45k prompt tokens cached to 40.5k of 45k.
+- 'Agent instructions in the system prompt' (`instructionsInSystemPrompt`, default on). Paperclip's
+  OpenCode adapter pastes the agent's whole AGENTS.md in front of every wake message, also when a
+  session is resumed, so each wake adds another uncached copy (about 2k tokens for a typical
+  file) to the session, and every later request resends all of them. With the setting on, the
+  adapter passes the file to OpenCode's `instructions` option instead, which puts it into the
+  system prompt under an `Instructions from: <path>` header: read fresh on every run, cached with
+  the tool definitions, never repeated, and kept across compaction. Remote runs, a relative
+  instructions path and an unreadable file keep Paperclip's behaviour. The first wake of an
+  existing session after switching misses the cache once, because the system prompt changed.
+- 'Keep the prompt cache warm between wakes' (`cacheKeepalive`, default on), with 'Keepalive
+  interval (minutes)' (`keepaliveIntervalMinutes`, default 4) and 'Keepalive for at most
+  (minutes)' (`keepaliveForMinutes`, default 30). Ollama drops a cached prompt after a few
+  minutes: measured on 2026-10-07, about 5 to 10 minutes for glm-5.3, 15 for
+  deepseek-v4.1-flash and 30 to 60 for kimi-k3. A wake that comes later resends the whole
+  session uncached. With the setting on, OpenCode reaches Ollama through a small proxy that the
+  adapter runs inside Paperclip's server process on 127.0.0.1. It forwards every request
+  unchanged and remembers the agent's last request per agent and issue. After the run it repeats
+  that request with a one-token reply at the interval, which reads the whole session from the
+  cache and costs almost nothing. The pings stop when the next run on the issue starts, after
+  the maximum time, when a plan limit is spent (pings never use usage credits) or when one fails.
+  The next run's log says how many pings kept the cache warm. The default interval stays below
+  the shortest lifetime measured, so new models need no tuning; raise it only for a model known
+  to keep its cache longer. Remote runs, runs without an issue and agents that set their own
+  `ollama-cloud` `baseURL` go straight to Ollama.
 - 'Reasoning effort' (`reasoningEffort`, default High; other choices Max, Medium, Low and Auto).
   The choice is mapped to the nearest reasoning variant the chosen model offers; a tie goes to the
   higher one, and a model that offers no variants gets no variant sent. Auto sends nothing and
