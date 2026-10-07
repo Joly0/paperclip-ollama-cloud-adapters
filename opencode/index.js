@@ -16,6 +16,7 @@ const {
   apiKeyFor,
   fetchUsage,
   getQuotaWindows,
+  meterFromError,
   ollamaGet,
   quotaConfigDoc,
   quotaFields,
@@ -87,12 +88,27 @@ function openCodeLiveEvents(line) {
   return [];
 }
 
+// Ollama's refusal text ("reached your session usage limit") arrives in an
+// OpenCode error event; the last one is kept so a failed run can be checked.
+function errorEventMessage(line) {
+  try {
+    const event = JSON.parse(line);
+    if (event?.type !== "error") return null;
+    return event.error?.data?.message ?? event.error?.message ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function createLiveEventLog(onLog, onEvent) {
-  if (!onEvent) return { log: onLog, flush: async () => {} };
   let buffer = "";
+  const state = { lastError: null };
   const emitLine = async (raw) => {
     const line = raw.trim();
     if (!line) return;
+    const error = errorEventMessage(line);
+    if (error) state.lastError = String(error);
+    if (!onEvent) return;
     for (const event of openCodeLiveEvents(line)) {
       try {
         await onEvent({ stream: "stdout", ...event });
@@ -102,6 +118,7 @@ function createLiveEventLog(onLog, onEvent) {
     }
   };
   return {
+    state,
     log: async (stream, chunk) => {
       await onLog(stream, chunk);
       if (stream !== "stdout") return;
@@ -123,7 +140,9 @@ function createLiveEventLog(onLog, onEvent) {
 
 // Reasoning effort, output cap, compaction and loop guard (run-settings.js).
 async function withRunSettings(ctx) {
-  const { config, note } = await applyRunSettings(ctx.config ?? {});
+  const context = ctx.context ?? {};
+  const issue = context.taskId ?? context.issueId;
+  const { config, note } = await applyRunSettings(ctx.config ?? {}, { agentId: ctx.agent?.id, issue });
   return { ctx: { ...ctx, config }, note };
 }
 
@@ -147,8 +166,10 @@ async function execute(rawCtx) {
   const credits = usesCredits(ctx.config);
   const usage = await fetchUsage(apiKey);
   const before = spentMeter(usage);
-  if (before && credits) {
-    await ctx.onLog("stderr", `[ollama-cloud] The ${before} limit is spent; this run uses usage credits.\n`);
+  const creditsLeft = usage?.creditsUsd == null || usage.creditsUsd > 0;
+  if (before && credits && creditsLeft) {
+    const left = usage?.creditsUsd == null ? "" : ` ($${usage.creditsUsd.toFixed(2)} left)`;
+    await ctx.onLog("stderr", `[ollama-cloud] The ${before} limit is spent; this run uses usage credits${left}.\n`);
   } else if (before) {
     const fields = quotaFields(before, Boolean(usage?.simulated));
     await ctx.onLog("stderr", `[ollama-cloud] ${fields.errorMessage} OpenCode was not started.\n`);
@@ -176,7 +197,7 @@ async function execute(rawCtx) {
   const result = {
     ...executed,
     biller: "ollama-cloud",
-    billingType: before && credits ? "credits" : "subscription_included",
+    billingType: before && credits && creditsLeft ? "credits" : "subscription_included",
   };
   const failed = result.exitCode !== 0 || result.timedOut || Boolean(result.errorMessage);
   if (!failed || ctx.signal?.aborted || result.errorFamily === "provider_quota") return result;
@@ -192,10 +213,11 @@ async function execute(rawCtx) {
   // and the retry resumes the kept OpenCode session (sessionParams below)
   // rather than replaying anything. Without it, every mid-run hit needs a
   // manual comment to continue.
+  const errorText = `${result.errorMessage ?? ""}\n${live.state.lastError ?? ""}`;
   const afterUsage = await fetchUsage(apiKey);
-  const after = spentMeter(afterUsage);
+  const after = meterFromError(errorText) ?? spentMeter(afterUsage);
   if (!after) return result;
-  if (credits && !LIMIT_ERROR.test(String(result.errorMessage ?? ""))) return result;
+  if (credits && !LIMIT_ERROR.test(errorText)) return result;
   const fields = quotaFields(after, Boolean(afterUsage?.simulated));
   await ctx.onLog(
     "stderr",

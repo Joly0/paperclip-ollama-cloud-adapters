@@ -11,9 +11,17 @@
 // When the compaction followed the model's final answer that only costs extra
 // requests (in testing the model re-read files it had already summarised), so
 // the continuation is kept only when the model was still mid-task.
+//
+// Stable temp path (PAPERCLIP_TMP_RUN, PAPERCLIP_TMP_STABLE): OpenCode puts
+// the run's temp folder into the bash tool's description. Paperclip makes a
+// new one per run, which changed the start of every request and made resumed
+// sessions miss the prompt cache. Descriptions show the adapter's fixed link
+// to the same folder instead; the folder itself is unchanged.
 
 const REPEATS = Number(process.env.PAPERCLIP_LOOP_GUARD_REPEATS) || 0;
 const STOP_WHEN_DONE = process.env.PAPERCLIP_COMPACTION_STOP_WHEN_DONE === "1";
+const TMP_RUN = process.env.PAPERCLIP_TMP_RUN || "";
+const TMP_STABLE = process.env.PAPERCLIP_TMP_STABLE || "";
 
 function stableStringify(value) {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
@@ -52,6 +60,13 @@ export const PaperclipGuards = async () => {
     hooks["experimental.compaction.autocontinue"] = async (input, output) => {
       if (input?.overflow) return;
       if (lastFinish.get(input?.sessionID) === "stop") output.enabled = false;
+    };
+  }
+  if (TMP_RUN && TMP_STABLE) {
+    hooks["tool.definition"] = async (_input, output) => {
+      if (typeof output?.description === "string" && output.description.includes(TMP_RUN)) {
+        output.description = output.description.split(TMP_RUN).join(TMP_STABLE);
+      }
     };
   }
   return hooks;

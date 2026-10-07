@@ -22,7 +22,87 @@ export const DEFAULTS = {
   pruneToolOutputs: false,
   loopGuard: true,
   loopGuardRepeats: 3,
+  stableTempDir: true,
 };
+
+// Paperclip gives every run a fresh scratch folder (paperclip-run-<issue>-<run>-<random>)
+// and points TMPDIR at it, so it can remove the run's temp files when the run
+// ends. OpenCode writes "$TMPDIR/opencode" into the bash tool's description,
+// which comes before the conversation in every request, so each resumed run
+// missed Ollama's prompt cache from that point on. TMPDIR stays as Paperclip
+// sets it; a stable link per agent and issue points at the current scratch
+// folder, and guards.js shows the model the link instead of the per-run path.
+const STABLE_TEMP_ROOT = path.join(os.tmpdir(), "paperclip-opencode");
+// A link whose target still exists belongs to a run that may still be active,
+// unless the target is older than this.
+const ACTIVE_RUN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const DANGLING_LINK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function safeSegment(value, fallback) {
+  const text = String(value ?? "").trim().replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 64);
+  return text && text !== "." && text !== ".." ? text : fallback;
+}
+
+// Removes links whose scratch folder is gone, once they are a day old.
+function sweepStableLinks() {
+  const now = Date.now();
+  let agents = [];
+  try {
+    agents = fs.readdirSync(STABLE_TEMP_ROOT);
+  } catch {
+    return;
+  }
+  for (const agent of agents) {
+    const agentDir = path.join(STABLE_TEMP_ROOT, agent);
+    let links = [];
+    try {
+      links = fs.readdirSync(agentDir);
+    } catch {
+      continue;
+    }
+    for (const name of links) {
+      const link = path.join(agentDir, name);
+      try {
+        const info = fs.lstatSync(link);
+        if (!info.isSymbolicLink() || fs.existsSync(link)) continue;
+        if (now - info.mtimeMs > DANGLING_LINK_MAX_AGE_MS) fs.unlinkSync(link);
+      } catch {
+        // Another run may be replacing it.
+      }
+    }
+  }
+}
+
+// Points the agent's link for this issue at the run's scratch folder. Returns
+// the env for guards.js, or null when TMPDIR is not a Paperclip scratch folder
+// or another run on the same issue still uses the link.
+function linkStableTemp(env, run) {
+  const scratch = envValue(env, "TMPDIR");
+  if (!scratch || !path.basename(scratch).startsWith("paperclip-run-")) return null;
+  sweepStableLinks();
+  const agentDir = path.join(STABLE_TEMP_ROOT, safeSegment(run.agentId, "agent"));
+  const link = path.join(agentDir, safeSegment(run.issue, "no-issue"));
+  fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  let current = null;
+  try {
+    current = fs.readlinkSync(link);
+  } catch {
+    // No link yet.
+  }
+  if (current && current !== scratch) {
+    try {
+      if (Date.now() - fs.statSync(current).mtimeMs < ACTIVE_RUN_MAX_AGE_MS) return null;
+    } catch {
+      // The previous run's folder is gone, so the link is free.
+    }
+  }
+  if (current !== scratch) {
+    const temp = `${link}.${process.pid}.${Date.now()}`;
+    fs.symlinkSync(scratch, temp);
+    fs.renameSync(temp, link);
+  }
+  return { PAPERCLIP_TMP_RUN: scratch, PAPERCLIP_TMP_STABLE: link };
+}
 
 // OpenCode's default compaction buffer (`compaction.reserved`).
 const COMPACTION_RESERVED = 20000;
@@ -166,7 +246,7 @@ function parseJsonObject(text) {
 // Adds the settings to the run's config: `variant` for OpenCode's --variant,
 // and env entries for the output cap, the inline OpenCode config and the loop
 // guard. Returns the new config and one log line describing what was applied.
-export async function applyRunSettings(config) {
+export async function applyRunSettings(config, run = {}) {
   const model = String(config.model ?? "").trim();
   const modelId = model.startsWith(MODEL_PREFIX) ? model.slice(MODEL_PREFIX.length) : model;
   const metadata = await modelMetadata(String(config.command ?? "").trim() || "opencode");
@@ -188,6 +268,16 @@ export async function applyRunSettings(config) {
     const variant = pickVariant(effort, info?.variants);
     next.variant = variant ?? "";
     notes.push(variant ? `effort ${effort} -> variant ${variant}` : `effort ${effort} (model has no variants, none sent)`);
+  }
+
+  let tempGuardEnv = null;
+  if (asBool(config.stableTempDir, DEFAULTS.stableTempDir)) {
+    try {
+      tempGuardEnv = linkStableTemp(env, run);
+      notes.push(tempGuardEnv ? `temp path shown as ${tempGuardEnv.PAPERCLIP_TMP_STABLE}` : "temp path per run (another run uses the link, or no Paperclip scratch folder)");
+    } catch (err) {
+      notes.push(`temp path per run (${err instanceof Error ? err.message : String(err)})`);
+    }
   }
 
   // Output cap. A value already in the agent's env wins.
@@ -244,12 +334,13 @@ export async function applyRunSettings(config) {
   } else {
     notes.push("loop guard off");
   }
+  if (tempGuardEnv) Object.assign(guardEnv, tempGuardEnv);
   if (Object.keys(guardEnv).length > 0) {
     try {
       installGuards(env);
       Object.assign(env, guardEnv);
     } catch (err) {
-      notes.push(`guards plugin not installed, loop guard and compaction stop inactive (${err instanceof Error ? err.message : String(err)})`);
+      notes.push(`guards plugin not installed, loop guard, compaction stop and stable temp path inactive (${err instanceof Error ? err.message : String(err)})`);
     }
   }
 
@@ -259,6 +350,13 @@ export async function applyRunSettings(config) {
 }
 
 export const runSettingsFields = [
+  {
+    key: "stableTempDir",
+    label: "Keep the prompt cache across runs",
+    type: "toggle",
+    default: DEFAULTS.stableTempDir,
+    hint: "Paperclip gives every run a new temporary folder and removes it when the run ends. OpenCode puts that folder's path into the bash tool's description near the start of every request, so a new path on each wake made Ollama's prompt cache miss for the whole resumed session. On shows the model a fixed link per agent and issue that points at the current run's folder instead. The temporary folder and its cleanup stay exactly as Paperclip handles them.",
+  },
   {
     key: "reasoningEffort",
     label: "Reasoning effort",

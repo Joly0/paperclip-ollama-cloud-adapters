@@ -33,6 +33,15 @@ Advanced, and timeout and interrupt grace period. The adapter adds these fields 
 - 'Skip permissions' (`adapterConfig` key `dangerouslySkipPermissions`, default on; unset counts as
   on, like `opencode_local`). It lets OpenCode access directories outside the workspace without
   asking, since unattended runs cannot answer permission prompts.
+- 'Keep the prompt cache across runs' (`stableTempDir`, default on). Paperclip gives every run a
+  new temporary folder (TMPDIR) and removes it when the run ends. OpenCode writes that path into
+  the bash tool's description, which comes before the conversation in every request, so each
+  resumed run missed Ollama's prompt cache for its whole history. With the setting on, the adapter
+  keeps a link `/tmp/paperclip-opencode/<agent id>/<issue id>` pointing at the current run's
+  folder, and guards.js shows the model the link instead. TMPDIR, the folder and Paperclip's
+  cleanup are unchanged. If another run on the same issue still uses the link, the new run keeps
+  the per-run path. Links whose folder is gone are removed after a day. Measured in Paperclip: a
+  resumed run's first request went from about 8k of 45k prompt tokens cached to 40.5k of 45k.
 - 'Reasoning effort' (`reasoningEffort`, default High; other choices Max, Medium, Low and Auto).
   The choice is mapped to the nearest reasoning variant the chosen model offers; a tie goes to the
   higher one, and a model that offers no variants gets no variant sent. Auto sends nothing and
@@ -41,11 +50,11 @@ Advanced, and timeout and interrupt grace period. The adapter adds these fields 
   the model: GLM, Kimi and DeepSeek have no Medium, Gemma, gpt-oss and Nemotron have no Max, and
   Low degrades some GLM models.
 - 'Keep running on usage credits' (`keepRunningOnCredits`, default off). Your Ollama plan has a
-  5 hour session limit and a weekly limit; when one is used up, Ollama charges further requests to
-  your prepaid usage credits, which are paid per token and listed with their cost in the Ollama
-  dashboard. Off: the agent waits for the limit to reset and never spends credits. On: it keeps
-  working and spends credits; if they run out, the run is retried after the reset. See Usage
-  limits.
+  5 hour session limit and a weekly limit on older (legacy) plans, a monthly allowance on newer
+  ones; when one is used up, Ollama charges further requests to your prepaid usage credits, which are paid per
+  token and listed with their cost in the Ollama dashboard. Off: the agent waits for the limit to
+  reset and never spends credits. On: it keeps working and spends credits; if they run out, the run
+  is retried after the reset. See Usage limits.
 - 'Raise OpenCode's output cap' (`raiseOutputCap`, default on). Sets
   `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` in the run's env; a value already in the agent env
   wins. 'Output cap (tokens)' (`outputTokenCap`) only applies when the cap is raised and overrides
@@ -85,15 +94,22 @@ Every resumed run resends the whole session, so a smaller session costs less on 
 Compaction summarises the session at the chosen size and pruning drops old tool outputs; both
 trade detail from earlier turns for lower usage.
 
+The prompt cache only helps while the start of the request stays byte-identical. Besides the temp
+path, an MCP server that connects in one run and not the next changes the tool list and has the
+same effect.
+
 The loop guard exists because a model can get stuck repeating the same tool call and burn quota on
 calls that cannot give a different result; the guard refuses those calls and returns an error to
 the model instead. The compaction stop keeps OpenCode from spending extra requests on a pointless
-continuation after a compaction that followed the model's final answer. Both guards live in
-guards.js, an OpenCode plugin the adapter installs. OpenCode 1.18 ignores file:// plugin entries in
-its config, so the adapter writes the file directly into OpenCode's config folder as
-plugins/paperclip-guards.js (`$XDG_CONFIG_HOME/opencode`, by default `~/.config/opencode`).
-Paperclip copies that folder into each run, so OpenCode loads the guards from there. Each guard is
-inert unless the run's env enables it, which keeps them per-agent settings.
+continuation after a compaction that followed the model's final answer. The stable temp path guard
+rewrites the bash tool's description through OpenCode's `tool.definition` hook, replacing
+`PAPERCLIP_TMP_RUN` (the run's temp folder) with `PAPERCLIP_TMP_STABLE` (the stable link from
+'Keep the prompt cache across runs'). All three guards live in guards.js, an OpenCode plugin the
+adapter installs. OpenCode 1.18 ignores file:// plugin entries in its config, so the adapter writes
+the file directly into OpenCode's config folder as plugins/paperclip-guards.js
+(`$XDG_CONFIG_HOME/opencode`, by default `~/.config/opencode`). Paperclip copies that folder into
+each run, so OpenCode loads the guards from there. Each guard is inert unless the run's env enables
+it, which keeps them per-agent settings.
 
 Each run's stderr starts with one `[ollama-cloud] <model>: ...` line listing the applied settings,
 so the transcript shows what was in effect.
@@ -113,23 +129,30 @@ for about 90 seconds and does not store it; the transcript is the history.
 
 ## Usage limits
 
-Before each run the adapter checks `https://ollama.com/api/usage`. If the 5 hour session limit or
-the weekly limit is spent, OpenCode is not started: the run ends as `provider_quota` with proof
-that no provider work started, and Paperclip schedules a retry 2 minutes after the next reset.
-This is the behaviour with 'Keep running on usage credits' off.
+Before each run the adapter checks `https://ollama.com/api/balance`, documented at
+`https://docs.ollama.com/api/balance`. The balance API allows 10 requests per minute per user.
+Plans with session and weekly limits report `remaining_percent` and `resets_at` per meter, newer
+plans a monthly allowance instead (`balance_usd` of `allowance_usd`, reset at `period.until`), and
+both report the purchased usage credits (`purchased.balance_usd`). If a limit is spent, OpenCode is
+not started: the run ends as `provider_quota` with proof that no provider work started, and
+Paperclip schedules a retry 2 minutes after the reset time the API reports. This is the behaviour
+with 'Keep running on usage credits' off.
 
 With 'Keep running on usage credits' on, a spent limit does not stop the run: OpenCode starts
 anyway, Ollama bills its requests to the account's prepaid usage credits, and a run that starts on
-a spent limit is labelled billing type `credits` instead of `subscription_included`.
-`https://ollama.com/api/usage` keeps reporting the limit as spent while credits are used and shows
-no balance. With credits on, a failure is not proof that a limit is spent, so a failed run is
-treated as a limit only when the error looks like a refused request: HTTP 429, rate limit, quota,
-credit, payment and similar messages.
+a spent limit is labelled billing type `credits` instead of `subscription_included`. The agent runs
+on credits only while the purchased balance is above zero; when the balance reports zero, the run
+is not started and is retried at the reset. With credits on, a failure is not proof that a limit is
+spent, so a failed run is treated as a limit only when the error looks like a refused request:
+HTTP 429, rate limit, quota, credit, payment and similar messages.
 
-The reset times are computed, because Ollama's API does not report them. The resets are global, the
-same moment for every account: the session meter resets whenever `unix time % 18000 == 0` (every
-5 hours from the Unix epoch), and the weekly meter resets at Monday 00:00 UTC. When a meter is
-still spent within 30 minutes after a reset, the adapter retries 15 minutes later instead of
+If the balance cannot be read, a spent limit is still recognised from Ollama's refusal of a
+request: HTTP 429 with "you (...) have reached your session usage limit" (or weekly).
+
+The computed schedule is only a fallback, used when the API reports no reset time. Its resets are
+global, the same moment for every account: the session meter resets whenever `unix time % 18000 == 0`
+(every 5 hours from the Unix epoch), and the weekly meter resets at Monday 00:00 UTC. When a meter
+is still spent within 30 minutes after a reset, the adapter retries 15 minutes later instead of
 waiting a whole window.
 
 Paperclip retries a failed run twice, then blocks the issue. A limit that runs out in the middle of
@@ -139,7 +162,8 @@ has worked. This is a deliberate trade-off: a limit stops OpenCode at its next m
 earlier tool calls have finished, and the retry resumes the same OpenCode session instead of
 replaying anything. Without it, every mid-run limit hit would need a manual comment to continue.
 
-The costs page shows both meters with their reset times.
+The costs page shows the session, weekly or monthly meters with their reset times and the credits
+left.
 
 The environment test normally runs OpenCode's hello probe. With a spent limit, that probe retries
 HTTP 429 until it times out and reports a misleading timeout, so the test replaces its result with
@@ -154,7 +178,8 @@ adds an info check noting that runs use usage credits until the limit resets.
 - The Paperclip server must run under its tsx loader, so that the image's TypeScript sources can be
   imported. The official image does this.
 - `OLLAMA_API_KEY` in the agent's env (a Paperclip secret reference) or in the container env.
-- An Ollama Cloud plan with session and weekly limits.
+- An Ollama Cloud plan with usage limits (a 5 hour session limit and a weekly limit on older
+  (legacy) plans, a monthly allowance on newer ones).
 
 ## Install
 
@@ -186,7 +211,7 @@ check, so no restart is needed. Delete it afterwards to return to real usage.
 - External adapter loading in Paperclip is new and can change between versions.
 - The adapter depends on the image's source layout (package paths and exports) and can break on
   upstream updates of Paperclip.
-- Ollama's reset schedule is not officially documented; the computed times follow the schedule
+- The computed fallback reset schedule is not officially documented; it follows the schedule
   observed on ollama.com (see ollama/ollama#12532).
 
 ## License
