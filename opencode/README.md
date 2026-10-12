@@ -95,8 +95,9 @@ Advanced, and timeout and interrupt grace period. The adapter adds these fields 
   whole session, so a smaller session costs less on every request, at the price of detail from
   earlier turns.
 - 'Compaction model' (`compactionModel`, default empty). The model that writes the session summary
-  when OpenCode compacts, for example `glm-5.3` or `deepseek-v4.1-flash` (the `ollama-cloud/`
-  prefix is optional); empty uses the agent's own model. It sets OpenCode's hidden `compaction`
+  when OpenCode compacts, picked from a dropdown of the models Ollama Cloud serves (refreshed at
+  most every 10 minutes); 'Agent's own model' (empty) uses the agent's model. Set through the API,
+  the value takes a model id with or without the `ollama-cloud/` prefix, for example `glm-5.3`. It sets OpenCode's hidden `compaction`
   agent's model, so it applies to every compaction, also OpenCode's default one when 'Compact long
   sessions' is off. A cheaper model costs less per compaction, but it cannot reuse the agent
   model's prompt cache and reads the whole session uncached, and its summary is all the agent

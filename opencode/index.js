@@ -383,6 +383,31 @@ const configSchema = {
   ],
 };
 
+// The form's compaction model dropdown lists the models Ollama Cloud serves.
+// Paperclip calls getConfigSchema on every form load (and when resolving
+// secrets) and a refresh takes seconds, so the form gets the last fetched list
+// at once and a refresh runs in the background at most every 10 minutes. A
+// saved model that is no longer listed still shows as the current value, and
+// the run falls back to the agent's model.
+const SCHEMA_MODELS_MAX_AGE_MS = 10 * 60 * 1000;
+let schemaModelsFetchedAt = Date.now();
+
+async function getConfigSchema() {
+  if (Date.now() - schemaModelsFetchedAt > SCHEMA_MODELS_MAX_AGE_MS) {
+    schemaModelsFetchedAt = Date.now();
+    listModels().catch(() => {});
+  }
+  const ids = cachedModels
+    .map((m) => (m.id.startsWith(MODEL_PREFIX) ? m.id.slice(MODEL_PREFIX.length) : m.id))
+    .sort();
+  const options = [{ label: "Agent's own model", value: "" }, ...ids.map((id) => ({ label: id, value: id }))];
+  return {
+    fields: configSchema.fields.map((field) =>
+      field.key === "compactionModel" ? { ...field, type: "select", options } : field,
+    ),
+  };
+}
+
 export function createServerAdapter() {
   return {
     type: TYPE,
@@ -403,6 +428,6 @@ export function createServerAdapter() {
     instructionsPathKey: "instructionsFilePath",
     requiresMaterializedRuntimeSkills: true,
     agentConfigurationDoc,
-    getConfigSchema: () => configSchema,
+    getConfigSchema,
   };
 }

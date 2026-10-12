@@ -518,7 +518,7 @@ export const runSettingsFields = [
     label: "Compaction model",
     type: "text",
     default: DEFAULTS.compactionModel,
-    hint: "Model that writes the session summary when OpenCode compacts, e.g. glm-5.3 or deepseek-v4.1-flash (with or without the ollama-cloud/ prefix). Empty uses the agent's own model. A cheaper model costs less per compaction, but it cannot reuse the agent model's prompt cache, so it reads the whole session uncached, and its summary is all the agent keeps of earlier turns. An unknown model, or one with less context than the session can reach, falls back to the agent's model. Applies to every compaction, also OpenCode's default one when 'Compact long sessions' is off.",
+    hint: "Model that writes the session summary when OpenCode compacts, from the models Ollama Cloud serves. \"Agent's own model\" keeps the agent's model. A cheaper model costs less per compaction, but it cannot reuse the agent model's prompt cache, so it reads the whole session uncached, and its summary is all the agent keeps of earlier turns. An unknown model, or one with less context than the session can reach, falls back to the agent's model. Applies to every compaction, also OpenCode's default one when 'Compact long sessions' is off.",
   },
   {
     key: "pruneToolOutputs",
