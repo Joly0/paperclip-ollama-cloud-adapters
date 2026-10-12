@@ -19,6 +19,7 @@ export const DEFAULTS = {
   autoOutputCapMax: 131072,
   compaction: false,
   compactAtTokens: 200000,
+  compactionModel: "",
   pruneToolOutputs: false,
   loopGuard: true,
   loopGuardRepeats: 3,
@@ -305,6 +306,8 @@ export async function applyRunSettings(config, run = {}) {
   const inline = parseJsonObject(envValue(env, "OPENCODE_CONFIG_CONTENT") ?? "");
   const compaction = { ...(inline.compaction ?? {}) };
   const guardEnv = {};
+  // Session size at which OpenCode compacts, for the compaction model check.
+  let compactsAt = info?.context ?? null;
   if (asBool(config.compaction, DEFAULTS.compaction) && info?.context) {
     // Without an input limit OpenCode compacts at "context minus output cap",
     // close to 1M tokens on these models. With one it compacts at "input limit
@@ -323,6 +326,7 @@ export async function applyRunSettings(config, run = {}) {
     provider["ollama-cloud"] = { ...cloud, models };
     inline.provider = provider;
     guardEnv.PAPERCLIP_COMPACTION_STOP_WHEN_DONE = "1";
+    compactsAt = input;
     notes.push(`compaction at ${input - COMPACTION_RESERVED} tokens`);
   } else {
     notes.push("compaction OpenCode default (near the full context)");
@@ -332,6 +336,33 @@ export async function applyRunSettings(config, run = {}) {
     notes.push("prune old tool outputs");
   }
   if (Object.keys(compaction).length > 0) inline.compaction = compaction;
+
+  // Compaction model. OpenCode summarises the session with its hidden
+  // "compaction" agent, which uses that agent's own model when one is set and
+  // the session's model otherwise. OpenCode aborts the compaction on a model it
+  // does not know, and a model with a smaller context cannot read the session,
+  // so both fall back to the session's model.
+  const compactionModelRaw = String(config.compactionModel ?? DEFAULTS.compactionModel).trim();
+  if (compactionModelRaw) {
+    const compactionModelId = compactionModelRaw.startsWith(MODEL_PREFIX)
+      ? compactionModelRaw.slice(MODEL_PREFIX.length)
+      : compactionModelRaw;
+    const compactionInfo = metadata[compactionModelId] ?? FALLBACK_MODELS[compactionModelId] ?? null;
+    if (compactionModelId === modelId) {
+      notes.push("compaction model is the session model");
+    } else if (!compactionInfo) {
+      notes.push(`compaction model ${compactionModelId} unknown to OpenCode, compacting with ${modelId}`);
+    } else if (compactsAt && compactionInfo.context && compactionInfo.context < compactsAt) {
+      notes.push(
+        `compaction model ${compactionModelId} has ${compactionInfo.context} tokens of context, below the ${compactsAt} the session can reach, compacting with ${modelId}`,
+      );
+    } else {
+      const agents = { ...(inline.agent ?? {}) };
+      agents.compaction = { ...(agents.compaction ?? {}), model: MODEL_PREFIX + compactionModelId };
+      inline.agent = agents;
+      notes.push(`compaction model ${compactionModelId}`);
+    }
+  }
 
   // Agent instructions. opencode_local prepends the whole AGENTS.md to the
   // prompt of every wake, resumed sessions included, so each wake adds an
@@ -480,7 +511,14 @@ export const runSettingsFields = [
     label: "Compact at (tokens)",
     type: "number",
     default: DEFAULTS.compactAtTokens,
-    hint: "Session size that triggers compaction (minimum 50,000). Fresh sessions start around 30k tokens; long runs reach 200k to 400k. Lower saves more and forgets more.",
+    hint: "Session size that triggers compaction (minimum 50,000). Fresh sessions start around 30k tokens; long runs reach 200k to 400k. Lower saves more and forgets more. Only used while 'Compact long sessions' is on.",
+  },
+  {
+    key: "compactionModel",
+    label: "Compaction model",
+    type: "text",
+    default: DEFAULTS.compactionModel,
+    hint: "Model that writes the session summary when OpenCode compacts, e.g. glm-5.3 or deepseek-v4.1-flash (with or without the ollama-cloud/ prefix). Empty uses the agent's own model. A cheaper model costs less per compaction, but it cannot reuse the agent model's prompt cache, so it reads the whole session uncached, and its summary is all the agent keeps of earlier turns. An unknown model, or one with less context than the session can reach, falls back to the agent's model. Applies to every compaction, also OpenCode's default one when 'Compact long sessions' is off.",
   },
   {
     key: "pruneToolOutputs",

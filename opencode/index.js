@@ -346,6 +346,7 @@ Runs OpenCode on Ollama Cloud. Same fields as opencode_local, with these differe
 - \`raiseOutputCap\` (default true) and \`outputTokenCap\` (empty means the model's output limit, at most 131072 and
   half its context) set \`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX\` unless the agent env sets it.
 - \`compaction\` (default false) and \`compactAtTokens\` (default 200000) make OpenCode compact at that session size;
+  \`compactionModel\` (default empty) sets the model OpenCode compacts with (its hidden compaction agent); empty uses the agent's model.
   \`pruneToolOutputs\` (default false) sets OpenCode's \`compaction.prune\`.
 - \`keepRunningOnCredits\` (default false) keeps running on prepaid usage credits once a plan limit is spent.
 - \`loopGuard\` (default true) and \`loopGuardRepeats\` (default 3) refuse that many identical tool calls in a row.

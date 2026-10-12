@@ -94,6 +94,15 @@ Advanced, and timeout and interrupt grace period. The adapter adds these fields 
   OpenCode keeps working only when the model was still mid-task. Each resumed run resends the
   whole session, so a smaller session costs less on every request, at the price of detail from
   earlier turns.
+- 'Compaction model' (`compactionModel`, default empty). The model that writes the session summary
+  when OpenCode compacts, for example `glm-5.3` or `deepseek-v4.1-flash` (the `ollama-cloud/`
+  prefix is optional); empty uses the agent's own model. It sets OpenCode's hidden `compaction`
+  agent's model, so it applies to every compaction, also OpenCode's default one when 'Compact long
+  sessions' is off. A cheaper model costs less per compaction, but it cannot reuse the agent
+  model's prompt cache and reads the whole session uncached, and its summary is all the agent
+  keeps of earlier turns. A model OpenCode does not list, or one with less context than the
+  session can reach, falls back to the agent's model; the run log's settings line says which
+  model compacts.
 - 'Prune old tool outputs' (`pruneToolOutputs`, default off). OpenCode's prune option: drops the
   output of old tool calls (file reads, build logs) from the session. Saves tokens on long runs;
   the agent has to re-read a file it needs again.
