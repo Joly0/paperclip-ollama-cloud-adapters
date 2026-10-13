@@ -30,6 +30,8 @@ const WEEK_OFFSET_MS = 4 * 86400_000;
 const RESET_MARGIN_MS = 2 * 60_000;
 // A meter still spent this soon after its reset is retried shortly instead of
 // waiting a whole window, in case the reset is late or the schedule changed.
+// Not for a limit that ran out mid-run: that run used up the new window, and
+// a needless early retry costs one of Paperclip's two automatic retries.
 const GRACE_AFTER_RESET_MS = 30 * 60_000;
 const GRACE_RETRY_MS = 15 * 60_000;
 
@@ -78,12 +80,12 @@ function windowMs(meter) {
 }
 
 // When to retry a spent meter, and why (for the run log).
-export function retryAt(meter, now = Date.now()) {
+export function retryAt(meter, now = Date.now(), { grace = true } = {}) {
   const simulatedDelay = readSimulation()?.minutes;
   if (simulatedDelay) return { at: new Date(now + simulatedDelay * 60_000), reason: "simulated delay" };
   const next = nextResetAt(meter, now);
   const sinceLastReset = now - (next.getTime() - windowMs(meter));
-  if (sinceLastReset < GRACE_AFTER_RESET_MS) {
+  if (grace && sinceLastReset < GRACE_AFTER_RESET_MS) {
     return { at: new Date(now + GRACE_RETRY_MS), reason: "still spent just after the reset" };
   }
   return { at: new Date(next.getTime() + RESET_MARGIN_MS), reason: `the ${meter} reset at ${next.toISOString()}` };
@@ -176,8 +178,9 @@ export function spentMeter(usage) {
 
 // Result fields for a run that ends because a meter is spent. The caller adds
 // executionRecovery only when it can prove no provider work started.
-export function quotaFields(meter, simulated = false) {
-  const retry = retryAt(meter);
+// `midRun` marks a limit that ran out during the run (no grace retry).
+export function quotaFields(meter, simulated = false, { midRun = false } = {}) {
+  const retry = retryAt(meter, Date.now(), { grace: !midRun });
   return {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",

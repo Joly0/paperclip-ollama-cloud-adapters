@@ -309,7 +309,7 @@ async function execute(rawCtx) {
   const after = meterFromError(errorText) ?? spentMeter(afterUsage);
   if (!after) return result;
   if (credits && !LIMIT_ERROR.test(errorText)) return result;
-  const fields = quotaFields(after, Boolean(afterUsage?.simulated));
+  const fields = quotaFields(after, Boolean(afterUsage?.simulated), { midRun: true });
   await ctx.onLog(
     "stderr",
     `[ollama-cloud] ${fields.errorMessage} The limit ran out mid-run; the retry resumes the same OpenCode session.\n`,
