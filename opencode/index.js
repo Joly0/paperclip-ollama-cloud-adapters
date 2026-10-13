@@ -16,6 +16,7 @@ const {
   apiKeyFor,
   fetchUsage,
   getQuotaWindows,
+  holdFields,
   meterFromError,
   ollamaGet,
   quotaConfigDoc,
@@ -30,6 +31,9 @@ const keepalive = await import(new URL(`./keepalive.js${new URL(import.meta.url)
 keepalive.configure({ fetchUsage, spentMeter });
 
 const TYPE = "opencode_ollama_cloud";
+// A held issue keeps its pings this long past the retry Paperclip schedules
+// after the session reset, so a retry that starts a little late is still warm.
+const HOLD_PING_TAIL_MS = 15 * 60 * 1000;
 const MODEL_PREFIX = "ollama-cloud/";
 
 const APP_DIR = process.env.PAPERCLIP_APP_DIR || "/app";
@@ -61,7 +65,7 @@ function usesCredits(config) {
 
 // With credits a failure is not proof of a spent limit, so only an error that
 // looks like a refused request (credits used up) is treated as one.
-const LIMIT_ERROR = /\b429\b|rate.?limit|quota|credit|usage limit|insufficient|payment|billing/i;
+const LIMIT_ERROR = /\b429\b|rate.?limit|quota|credit|usage limit|5-hour limit|weekly limit|insufficient|payment|billing/i;
 
 function failedResult(errorMessage, errorCode) {
   return { exitCode: 1, signal: null, timedOut: false, errorMessage, errorCode };
@@ -160,11 +164,24 @@ async function withRunSettings(ctx) {
     }
   }
   const settings = await applyRunSettings(ctx.config ?? {}, { agentId, issue, remote, proxyBaseUrl, proxyError });
-  return { ctx: { ...ctx, config: settings.config }, note: settings.note, keepaliveKey, keepaliveOptions: settings.keepalive };
+  return {
+    ctx: { ...ctx, config: settings.config },
+    note: settings.note,
+    keepaliveKey,
+    keepaliveOptions: settings.keepalive,
+    sessionHold: settings.sessionHold,
+  };
+}
+
+// Keep a held issue's cache warm until just after the retry at the reset.
+function holdKeepalive(keepaliveKey, keepaliveOptions, apiKey, fields, used) {
+  if (!keepaliveKey || !keepaliveOptions) return;
+  const holdUntil = Date.parse(fields.retryNotBefore) + HOLD_PING_TAIL_MS;
+  keepalive.endRun(keepaliveKey, { ...keepaliveOptions, apiKey, holdUntil, holdUsed: used });
 }
 
 async function execute(rawCtx) {
-  const { ctx, note, keepaliveKey, keepaliveOptions } = await withRunSettings(rawCtx);
+  const { ctx, note, keepaliveKey, keepaliveOptions, sessionHold } = await withRunSettings(rawCtx);
   const model = String(ctx.config?.model ?? "").trim();
   if (!model.startsWith(MODEL_PREFIX)) {
     return failedResult(
@@ -200,30 +217,79 @@ async function execute(rawCtx) {
       executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
     };
   }
+  if (sessionHold && !before && typeof usage?.session === "number" && usage.session * 100 >= sessionHold.atPercent) {
+    const fields = holdFields(usage.session, sessionHold.atPercent);
+    holdKeepalive(keepaliveKey, keepaliveOptions, apiKey, fields, usage.session);
+    const warm = keepaliveKey && keepaliveOptions ? " The cache is kept warm until then." : "";
+    await ctx.onLog("stderr", `[ollama-cloud] ${fields.errorMessage} OpenCode was not started.${warm}\n`);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      ...fields,
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    };
+  }
 
   // OpenCode guesses the biller from the env and picks OpenRouter whenever
   // OPENROUTER_API_KEY is set; these runs are paid by the Ollama subscription.
   await ctx.onLog("stderr", `${note}\n`);
   if (keepaliveKey) {
-    const warm = keepalive.beginRun(keepaliveKey);
+    // The proxy only sees requests when the keepalive routes OpenCode to it.
+    // A spent session (running on credits) has nothing left to hold.
+    const hold = sessionHold && keepaliveOptions && !before ? { atPercent: sessionHold.atPercent, apiKey } : null;
+    const warm = keepalive.beginRun(keepaliveKey, hold);
     if (warm.pings > 0) {
       const cached = warm.lastCached == null ? "" : `, the last one read ${warm.lastCached} tokens from cache`;
       await ctx.onLog("stderr", `[ollama-cloud] Cache kept warm since the last run: ${warm.pings} keepalive ping(s)${cached}.\n`);
     }
+    if (warm.hold) {
+      const pct = (v) => (v == null ? "unknown" : `${Math.round(v * 1000) / 10}%`);
+      await ctx.onLog(
+        "stderr",
+        `[ollama-cloud] Held for the session reset: ${warm.hold.pings} ping(s) while held; the session meter read ${pct(warm.hold.startUsed)} when the hold started and ${pct(warm.hold.peakUsed)} at its highest before the reset (other agents' use included).\n`,
+      );
+    }
   }
   const live = createLiveEventLog(ctx.onLog, ctx.onEvent);
   let executed;
+  let held = null;
+  let heldFields = null;
   try {
     executed = await oc.execute({ ...ctx, onLog: live.log });
   } finally {
     await live.flush();
-    if (keepaliveKey) keepalive.endRun(keepaliveKey, keepaliveOptions ? { ...keepaliveOptions, apiKey } : null);
+    if (keepaliveKey) {
+      held = sessionHold ? keepalive.tripped(keepaliveKey) : null;
+      if (held) {
+        heldFields = holdFields(held.used, held.atPercent);
+        holdKeepalive(keepaliveKey, keepaliveOptions, apiKey, heldFields, held.used);
+      } else {
+        keepalive.endRun(keepaliveKey, keepaliveOptions ? { ...keepaliveOptions, apiKey } : null);
+      }
+    }
   }
   const result = {
     ...executed,
     biller: "ollama-cloud",
     billingType: before && credits && creditsLeft ? "credits" : "subscription_included",
   };
+
+  // The proxy refused a request at the session hold, so OpenCode stopped
+  // before its next model turn, like at a spent limit. Same trade-off as
+  // below: bootstrap evidence, so the retry at the reset resumes the session.
+  if (heldFields && !ctx.signal?.aborted) {
+    await ctx.onLog(
+      "stderr",
+      `[ollama-cloud] ${heldFields.errorMessage} The run stopped at the hold; the retry resumes the same OpenCode session with the cache kept warm until then.\n`,
+    );
+    return {
+      ...result,
+      ...heldFields,
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      errorMessage: `${heldFields.errorMessage} The run stopped at the hold; the retry resumes the same OpenCode session.`,
+    };
+  }
   const failed = result.exitCode !== 0 || result.timedOut || Boolean(result.errorMessage);
   if (!failed || ctx.signal?.aborted || result.errorFamily === "provider_quota") return result;
 
@@ -349,6 +415,9 @@ Runs OpenCode on Ollama Cloud. Same fields as opencode_local, with these differe
   \`compactionModel\` (default empty) sets the model OpenCode compacts with (its hidden compaction agent); empty uses the agent's model.
   \`pruneToolOutputs\` (default false) sets OpenCode's \`compaction.prune\`.
 - \`keepRunningOnCredits\` (default false) keeps running on prepaid usage credits once a plan limit is spent.
+- \`holdNearSessionLimit\` (default false) and \`holdAtSessionPercent\` (default 90, 50 to 99) stop the agent once the
+  session meter reaches that share: the keepalive proxy refuses the running run's next request, new runs are not
+  started, the issue is retried just after the session reset, and the cache is kept warm until then.
 - \`loopGuard\` (default true) and \`loopGuardRepeats\` (default 3) refuse that many identical tool calls in a row.
 ${quotaConfigDoc}
 

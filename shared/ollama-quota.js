@@ -6,7 +6,8 @@
 // for each; newer plans report a monthly dollar allowance instead. Purchased
 // usage credits are reported in both. If the balance is unavailable, a spent
 // limit is still recognised from the refused request: Ollama answers HTTP 429
-// "you (...) have reached your session usage limit".
+// "you (...) have reached your session usage limit", since 2026-10 "You
+// reached your Pro 5-hour limit" (or weekly).
 //
 // The fallback reset schedule below is used only when the balance API gives
 // no reset time. The resets are global, the same moment for every
@@ -35,14 +36,23 @@ const GRACE_RETRY_MS = 15 * 60_000;
 // Test switch: a file named .simulate-quota next to this module, containing
 // "session" or "weekly" and optionally a retry delay in minutes ("weekly 10",
 // default 5), makes every usage check report that meter as spent and retries
-// after that delay instead of the real reset. Delete the file to return to
-// real usage.
+// after that delay instead of the real reset. "used 92" instead reports the
+// session as 92% used and nothing spent, to test the session hold without
+// spending anything; an optional third value moves the held retry that many
+// minutes ahead instead of the real reset ("used 92 5"). Delete the file to
+// return to real usage.
 const SIMULATE_FILE = new URL("./.simulate-quota", import.meta.url);
 const DEFAULT_SIMULATED_DELAY_MINUTES = 5;
 
 function readSimulation() {
   try {
-    const [meter, minutes] = fs.readFileSync(SIMULATE_FILE, "utf8").trim().split(/\s+/);
+    const [meter, minutes, holdMinutes] = fs.readFileSync(SIMULATE_FILE, "utf8").trim().split(/\s+/);
+    if (meter === "used") {
+      const used = Number(minutes);
+      if (!Number.isFinite(used) || used < 0 || used >= 100) return null;
+      const delay = Number(holdMinutes);
+      return { used: used / 100, holdMinutes: Number.isFinite(delay) && delay >= 1 ? delay : null };
+    }
     if (meter !== "session" && meter !== "weekly") return null;
     const delay = Number(minutes);
     return { meter, minutes: Number.isFinite(delay) && delay >= 1 ? delay : DEFAULT_SIMULATED_DELAY_MINUTES };
@@ -109,9 +119,13 @@ export async function ollamaGet(apiPath, apiKey) {
 // balance in USD, and whether the balance API answered. Null when it cannot
 // be reached at all.
 export async function fetchUsage(apiKey) {
-  const simulated = readSimulation()?.meter;
+  const simulation = readSimulation();
+  const simulated = simulation?.meter;
   if (simulated) {
     return { session: simulated === "session" ? 1 : 0, weekly: simulated === "weekly" ? 1 : 0, monthly: null, creditsUsd: null, simulated: true };
+  }
+  if (simulation?.used != null) {
+    return { session: simulation.used, weekly: 0, monthly: null, creditsUsd: null, simulated: true };
   }
   if (!apiKey) return null;
   try {
@@ -144,8 +158,12 @@ export async function fetchUsage(apiKey) {
 
 // The meter named by Ollama's refusal of a request, or null.
 export function meterFromError(text) {
-  const match = /reached your (session|weekly|monthly) usage limit/i.exec(String(text ?? ""));
-  return match ? match[1].toLowerCase() : null;
+  // Both wordings: "reached your session usage limit" and, with the plan
+  // name in front, "reached your Pro 5-hour limit".
+  const match = /reached your (?:[\w-]+ )?(session|5-hour|weekly|monthly)(?: usage)? limit/i.exec(String(text ?? ""));
+  if (!match) return null;
+  const meter = match[1].toLowerCase();
+  return meter === "5-hour" ? "session" : meter;
 }
 
 export function spentMeter(usage) {
@@ -168,6 +186,25 @@ export function quotaFields(meter, simulated = false) {
       `Ollama Cloud ${meter} limit is spent${simulated ? " (simulated by .simulate-quota)" : ""}. ` +
       `Paperclip retries this issue at ${retry.at.toISOString()} (${retry.reason}).`,
     errorMeta: { ollamaMeter: meter, retryReason: retry.reason, simulated },
+  };
+}
+
+// Result fields for a run held back because the session reached the agent's
+// hold share. Unlike a spent meter, the session is retried right after its
+// reported reset: the meter is not spent, so the grace retry does not apply.
+export function holdFields(sessionUsed, atPercent, now = Date.now()) {
+  const reset = nextResetAt("session", now);
+  const simulatedDelay = readSimulation()?.holdMinutes;
+  const at = simulatedDelay ? new Date(now + simulatedDelay * 60_000) : new Date(reset.getTime() + RESET_MARGIN_MS);
+  const used = Math.round(sessionUsed * 1000) / 10;
+  return {
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    retryNotBefore: at.toISOString(),
+    errorMessage:
+      `Ollama Cloud session is ${used}% used, at or above this agent's hold at ${atPercent}%. ` +
+      `Paperclip retries this issue at ${at.toISOString()} (the session reset at ${reset.toISOString()}).`,
+    errorMeta: { ollamaMeter: "session", sessionHold: true, sessionUsedPercent: used, holdAtPercent: atPercent },
   };
 }
 

@@ -30,7 +30,14 @@ export const DEFAULTS = {
   cacheKeepalive: true,
   keepaliveIntervalMinutes: 4,
   keepaliveForMinutes: 30,
+  holdNearSessionLimit: false,
+  holdAtSessionPercent: 90,
 };
+
+// Bounds for holdAtSessionPercent: below 50 an agent would idle most of each
+// session; at 100 the limit is spent and pings cannot run any more.
+const HOLD_PERCENT_MIN = 50;
+const HOLD_PERCENT_MAX = 99;
 
 // Paperclip gives every run a fresh scratch folder (paperclip-run-<issue>-<run>-<random>)
 // and points TMPDIR at it, so it can remove the run's temp files when the run
@@ -414,6 +421,18 @@ export async function applyRunSettings(config, run = {}) {
     }
   }
 
+  // Session hold: stop work at a share of the session limit. With the proxy
+  // the stop also applies mid-run and the cache stays warm until the reset;
+  // without it only new runs are held back.
+  let sessionHold = null;
+  if (asBool(config.holdNearSessionLimit, DEFAULTS.holdNearSessionLimit)) {
+    const percent = Math.min(HOLD_PERCENT_MAX, Math.max(HOLD_PERCENT_MIN, asPositiveInt(config.holdAtSessionPercent) ?? DEFAULTS.holdAtSessionPercent));
+    sessionHold = { atPercent: percent };
+    notes.push(keepalive
+      ? `hold at ${percent}% of the session, cache kept warm until the reset`
+      : `hold at ${percent}% of the session, checked before each run only (cache keepalive is off)`);
+  }
+
   if (asBool(config.loopGuard, DEFAULTS.loopGuard)) {
     const repeats = Math.max(2, asPositiveInt(config.loopGuardRepeats) ?? DEFAULTS.loopGuardRepeats);
     guardEnv.PAPERCLIP_LOOP_GUARD_REPEATS = String(repeats);
@@ -433,7 +452,7 @@ export async function applyRunSettings(config, run = {}) {
 
   if (Object.keys(inline).length > 0) env.OPENCODE_CONFIG_CONTENT = JSON.stringify(inline);
   next.env = env;
-  return { config: next, note: `[ollama-cloud] ${modelId}: ${notes.join("; ")}.`, keepalive };
+  return { config: next, note: `[ollama-cloud] ${modelId}: ${notes.join("; ")}.`, keepalive, sessionHold };
 }
 
 export const runSettingsFields = [
@@ -471,6 +490,20 @@ export const runSettingsFields = [
     type: "number",
     default: DEFAULTS.keepaliveForMinutes,
     hint: "How long after a run the cache is kept warm when no new run on the issue starts. Longer helps issues that wait for a review or a reply; each extra interval is one more ping, also for issues that are already done.",
+  },
+  {
+    key: "holdNearSessionLimit",
+    label: "Hold near the session limit",
+    type: "toggle",
+    default: DEFAULTS.holdNearSessionLimit,
+    hint: "Off works until the 5-hour session limit is spent; the cache then goes cold and the run after the reset resends the whole session uncached. On stops this agent once the session reaches the share below: a run in progress ends at its next model request, new runs do not start, and the cache keepalive goes on pinging until the session resets, so the retry right after the reset starts warm. The pings draw on the remaining share, and they stop if the session is spent anyway. Needs the cache keepalive; with it off, only new runs are held back. The weekly limit is not affected.",
+  },
+  {
+    key: "holdAtSessionPercent",
+    label: "Hold at session usage (%)",
+    type: "number",
+    default: DEFAULTS.holdAtSessionPercent,
+    hint: "Session usage at which the hold starts (50 to 99). The rest is the reserve the keepalive pings spend until the reset, shared by every held agent. Lower leaves more for the pings and stops work earlier; higher works longer but risks running out before the reset, which loses the cache. Only used while 'Hold near the session limit' is on.",
   },
   {
     key: "reasoningEffort",

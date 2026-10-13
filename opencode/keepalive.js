@@ -10,6 +10,11 @@
 // pings stop when a new run on the issue starts, after a maximum time, when a
 // plan limit is spent (pings never use usage credits) or when one fails.
 //
+// Session hold: an agent can be stopped at a share of the 5-hour session
+// limit. The proxy then refuses its next request with HTTP 400, which OpenCode
+// does not retry, so the run ends at once; the pings go on until the session
+// resets, so the retry right after the reset finds the cache warm.
+//
 // The proxy and its sessions live on globalThis so an adapter reload keeps the
 // port that running OpenCode processes use; the newest module's code handles
 // requests and pings.
@@ -40,7 +45,12 @@ export function configure(helpers) {
 function session(key) {
   let s = shared.sessions.get(key);
   if (!s) {
-    s = { body: null, path: null, apiKey: null, timer: null, active: false, deadline: 0, intervalMs: 0, pings: 0, lastCached: null };
+    s = {
+      body: null, path: null, apiKey: null, timer: null, active: false, deadline: 0, intervalMs: 0, pings: 0, lastCached: null,
+      // Session hold: armed for the running run, what tripped it, and the
+      // session meter readings while the pings wait for the reset.
+      hold: null, tripped: null, holdStats: null,
+    };
     shared.sessions.set(key, s);
   }
   return s;
@@ -91,6 +101,38 @@ function forward(req, res, key, upstreamPath, raw) {
   else up.end();
 }
 
+// The session hold of a running run, once the session meter has reached it.
+// The meter is read at most once a minute, so a run can overshoot the hold by
+// up to a minute of work. An unreadable meter lets the request through.
+async function holdReached(key) {
+  const s = shared.sessions.get(key);
+  if (!s?.hold) return null;
+  if (s.tripped) return s.tripped;
+  try {
+    const used = (await readUsage(s.hold.apiKey))?.session;
+    if (typeof used === "number" && used * 100 >= s.hold.atPercent) {
+      s.tripped = { used, atPercent: s.hold.atPercent };
+    }
+  } catch {
+    // Unknown: keep working.
+  }
+  return s.tripped;
+}
+
+// HTTP 400 because OpenCode retries 429 and 5xx (until its own timeout) but
+// gives up on other client errors at once, with this message in its error.
+function refuse(res, held) {
+  const used = Math.round(held.used * 1000) / 10;
+  res.writeHead(400, { "content-type": "application/json" });
+  res.end(JSON.stringify({
+    error: {
+      message: `Held by the ollama-cloud adapter: the Ollama Cloud session is ${used}% used, at or above this agent's hold at ${held.atPercent}%. The issue is retried after the session reset.`,
+      type: "invalid_request_error",
+      code: "session_hold",
+    },
+  }));
+}
+
 // Requests arrive as /s/<encoded key>/v1/...; the rest goes to ollama.com.
 function handle(req, res) {
   const match = /^\/s\/([^/]+)(\/.*)$/.exec(req.url ?? "");
@@ -102,9 +144,18 @@ function handle(req, res) {
   const upstreamPath = match[2];
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
-  req.on("end", () => {
+  req.on("end", async () => {
     const raw = chunks.length > 0 ? Buffer.concat(chunks) : null;
-    if (raw && req.method === "POST" && upstreamPath.endsWith("/chat/completions")) remember(key, upstreamPath, raw);
+    if (raw && req.method === "POST" && upstreamPath.endsWith("/chat/completions")) {
+      // Remembered also when refused: it carries the latest tool results,
+      // which the first ping then caches for the run after the reset.
+      remember(key, upstreamPath, raw);
+      const held = await holdReached(key);
+      if (held) {
+        refuse(res, held);
+        return;
+      }
+    }
     forward(req, res, key, upstreamPath, raw);
   });
 }
@@ -128,26 +179,41 @@ export async function baseUrlFor(key) {
 }
 
 // A run starts: stop pinging and report what the pause between runs cost.
-export function beginRun(key) {
+// `hold` ({ atPercent, apiKey }) arms the session hold for this run.
+export function beginRun(key, hold = null) {
   const s = session(key);
   stop(s);
   s.active = true;
-  const result = { pings: s.pings, lastCached: s.lastCached };
+  s.hold = hold;
+  s.tripped = null;
+  const result = { pings: s.pings, lastCached: s.lastCached, hold: s.holdStats };
   s.pings = 0;
   s.lastCached = null;
+  s.holdStats = null;
   return result;
 }
 
-// A run ended: keep the cache warm until the next run or the deadline.
+// What stopped the run at the session hold ({ used, atPercent }), or null.
+export function tripped(key) {
+  return shared.sessions.get(key)?.tripped ?? null;
+}
+
+// A run ended, or a held run was not started: keep the cache warm until the
+// next run or the deadline. `holdUntil` (ms) extends the deadline to the
+// session reset; `holdUsed` is the session meter when the hold started.
 export function endRun(key, options) {
   const s = shared.sessions.get(key);
   if (!s) return;
   s.active = false;
+  s.hold = null;
   stop(s);
   if (!options || !s.body) return;
   s.apiKey = options.apiKey;
   s.intervalMs = options.intervalMinutes * 60 * 1000;
-  s.deadline = Date.now() + options.forMinutes * 60 * 1000;
+  s.deadline = Math.max(Date.now() + options.forMinutes * 60 * 1000, options.holdUntil ?? 0);
+  if (options.holdUntil) {
+    s.holdStats ??= { pings: 0, startUsed: options.holdUsed ?? null, peakUsed: options.holdUsed ?? null };
+  }
   schedule(key, s);
 }
 
@@ -160,22 +226,30 @@ function schedule(key, s) {
   s.timer.unref?.();
 }
 
-// Past the deadline the cache is gone anyway; drop the stored request.
+// Past the deadline the cache is gone anyway; drop the stored request. The
+// entry stays while it has pings or hold readings for the next run to report.
 function forget(key, s) {
   stop(s);
   s.body = null;
   s.apiKey = null;
-  if (s.pings === 0) shared.sessions.delete(key);
+  if (s.pings === 0 && !s.holdStats) shared.sessions.delete(key);
+}
+
+// The balance lookup, shared by the pings and the session hold of every
+// agent on the same key and cached for a minute (the API allows 10 a minute).
+async function readUsage(apiKey) {
+  if (!quota.fetchUsage) return null;
+  const cached = shared.usage.get(apiKey);
+  if (cached && "usage" in cached && Date.now() - cached.at < USAGE_CACHE_MS) return cached.usage;
+  const usage = await quota.fetchUsage(apiKey);
+  shared.usage.set(apiKey, { at: Date.now(), usage });
+  return usage;
 }
 
 async function planSpent(apiKey) {
   if (!quota.fetchUsage || !quota.spentMeter) return false;
-  const cached = shared.usage.get(apiKey);
-  if (cached && Date.now() - cached.at < USAGE_CACHE_MS) return cached.spent;
   try {
-    const spent = Boolean(quota.spentMeter(await quota.fetchUsage(apiKey)));
-    shared.usage.set(apiKey, { at: Date.now(), spent });
-    return spent;
+    return Boolean(quota.spentMeter(await readUsage(apiKey)));
   } catch {
     return true; // Unknown: do not risk spending credits.
   }
@@ -222,6 +296,13 @@ async function ping(key) {
       return;
     }
     s.pings += 1;
+    if (s.holdStats) {
+      // What the held pings cost: the highest session reading before the
+      // reset (readings after it are lower, so the maximum is the last one).
+      s.holdStats.pings += 1;
+      const used = shared.usage.get(s.apiKey)?.usage?.session;
+      if (typeof used === "number") s.holdStats.peakUsed = Math.max(s.holdStats.peakUsed ?? 0, used);
+    }
     try {
       s.lastCached = JSON.parse(res.text)?.usage?.prompt_tokens_details?.cached_tokens ?? null;
     } catch {
