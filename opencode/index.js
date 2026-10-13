@@ -317,6 +317,7 @@ async function execute(rawCtx) {
   return {
     ...result,
     ...fields,
+    resultJson: { ...(result.resultJson ?? {}), ...fields.resultJson },
     executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
     errorMessage: `${fields.errorMessage} The limit ran out mid-run; the retry resumes the same OpenCode session. OpenCode said: ${result.errorMessage ?? "(no message)"}`,
   };

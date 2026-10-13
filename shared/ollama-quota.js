@@ -88,7 +88,7 @@ export function retryAt(meter, now = Date.now(), { grace = true } = {}) {
   if (grace && sinceLastReset < GRACE_AFTER_RESET_MS) {
     return { at: new Date(now + GRACE_RETRY_MS), reason: "still spent just after the reset" };
   }
-  return { at: new Date(next.getTime() + RESET_MARGIN_MS), reason: `the ${meter} reset at ${next.toISOString()}` };
+  return { at: new Date(next.getTime() + RESET_MARGIN_MS), reason: `the ${meter} limit resets on ${next.toISOString()}` };
 }
 
 export function configEnv(config) {
@@ -176,6 +176,10 @@ export function spentMeter(usage) {
   return null;
 }
 
+// Reset times in the messages say "resets on <ISO time>": Paperclip's fallback
+// parser reads "reset at 2026-..." as 20:00 (the year's first two digits). It
+// reads the stored resultJson first, so the retry time goes there as well.
+
 // Result fields for a run that ends because a meter is spent. The caller adds
 // executionRecovery only when it can prove no provider work started.
 // `midRun` marks a limit that ran out during the run (no grace retry).
@@ -185,6 +189,7 @@ export function quotaFields(meter, simulated = false, { midRun = false } = {}) {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
     retryNotBefore: retry.at.toISOString(),
+    resultJson: { providerQuotaRetryNotBefore: retry.at.toISOString() },
     errorMessage:
       `Ollama Cloud ${meter} limit is spent${simulated ? " (simulated by .simulate-quota)" : ""}. ` +
       `Paperclip retries this issue at ${retry.at.toISOString()} (${retry.reason}).`,
@@ -204,9 +209,10 @@ export function holdFields(sessionUsed, atPercent, now = Date.now()) {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
     retryNotBefore: at.toISOString(),
+    resultJson: { providerQuotaRetryNotBefore: at.toISOString() },
     errorMessage:
       `Ollama Cloud session is ${used}% used, at or above this agent's hold at ${atPercent}%. ` +
-      `Paperclip retries this issue at ${at.toISOString()} (the session reset at ${reset.toISOString()}).`,
+      `Paperclip retries this issue at ${at.toISOString()} (the session limit resets on ${reset.toISOString()}).`,
     errorMeta: { ollamaMeter: "session", sessionHold: true, sessionUsedPercent: used, holdAtPercent: atPercent },
   };
 }
